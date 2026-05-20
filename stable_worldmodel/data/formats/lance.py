@@ -422,8 +422,11 @@ class LanceDataset(Dataset):
             tensor = tensor.permute(0, 3, 1, 2)
         return tensor
 
-    def _process_batch(self, ep_idx: int, g_start: int, batch) -> dict:
-        g_end = g_start + self.span
+    def _process_batch(
+        self, ep_idx: int, g_start: int, batch, g_end: int | None = None
+    ) -> dict:
+        if g_end is None:
+            g_end = g_start + self.span
         steps: dict[str, Any] = {}
         for col in self._keys:
             if col in self._cache:
@@ -468,7 +471,9 @@ class LanceDataset(Dataset):
         g_start = int(self.offsets[ep_idx] + start)
         rows = list(range(g_start, g_start + (end - start)))
         batch = self._fetch_rows(rows)
-        steps = self._process_batch(ep_idx, g_start, batch)
+        steps = self._process_batch(
+            ep_idx, g_start, batch, g_end=g_start + (end - start)
+        )
         return self.transform(steps) if self.transform else steps
 
     def __getitems__(self, indices: list[int]) -> list[dict]:
