@@ -1,5 +1,7 @@
 import os
+import sys
 from functools import partial
+from pathlib import Path
 
 import hydra
 import lightning as pl
@@ -15,6 +17,9 @@ from stable_worldmodel.data import column_normalizer as get_column_normalizer
 from stable_worldmodel.wm.loss import SIGReg
 
 from utils import SaveCkptCallback, build_wandb_logger, get_img_preprocessor, setup_run_dir
+
+# Make scripts/plan importable for eval_model
+sys.path.insert(0, str(Path(__file__).parent.parent / 'plan'))
 
 
 def lejepa_forward(self, batch, stage, cfg):
@@ -125,6 +130,12 @@ def run(cfg):
 
     last_ckpt = run_dir / 'lightning' / 'last.ckpt'
 
+    pt = cfg.get('post_training', {})
+    probe_cfg = None
+    if pt.get('run_probe', False):
+        probe_cfg = OmegaConf.to_container(pt.probe, resolve=True)
+        probe_cfg['img_size'] = cfg.img_size
+
     callbacks = [
         ModelCheckpoint(
             dirpath=run_dir / 'lightning',
@@ -140,6 +151,8 @@ def run(cfg):
             run_name=cfg.output_model_name,
             cfg=cfg,
             every_n_epochs=cfg.checkpointing.every_n_epochs,
+            probe_cfg=probe_cfg,
+            device=cfg.get('device', 'cpu'),
         ),
     ]
 
@@ -156,6 +169,84 @@ def run(cfg):
         data=data_module,
         ckpt_path=last_ckpt if last_ckpt.exists() else None,
     )()
+
+    _run_post_training(cfg, world_model.model, pl_logger)
+
+
+def _run_post_training(cfg, model, pl_logger):
+    """Run CEM planning eval after training and log to W&B."""
+    pt = cfg.get('post_training', {})
+    if not pt:
+        return
+
+    import wandb
+
+    def _wandb_log(metrics: dict):
+        if wandb.run is not None:
+            wandb.log(metrics)
+
+    # ── CEM planning evaluation ─────────────────────────────────────────────
+    if pt.get('run_eval', False):
+        logging.info('=== Post-training: CEM planning evaluation ===')
+        from omegaconf import OmegaConf as OC
+        from eval_wm import eval_model
+
+        eval_cfg_raw = OmegaConf.to_container(pt.eval, resolve=True)
+        eval_cfg = OC.create({
+            'world': {
+                'env_name':          eval_cfg_raw['env_name'],
+                'num_envs':          eval_cfg_raw['num_envs'],
+                'max_episode_steps': eval_cfg_raw['max_episode_steps'],
+            },
+            'seed':        eval_cfg_raw['seed'],
+            'policy':      f"{cfg.output_model_name}/weights_epoch_{cfg.trainer.max_epochs:04d}.pt",
+            'solver':      eval_cfg_raw['solver'],
+            'plan_config': eval_cfg_raw['plan_config'],
+            'dataset':     {'keys_to_cache': eval_cfg_raw['keys_to_cache']},
+            'eval': {
+                'num_eval':           eval_cfg_raw['num_eval'],
+                'goal_offset_steps':  eval_cfg_raw['goal_offset_steps'],
+                'eval_budget':        eval_cfg_raw['eval_budget'],
+                'img_size':           cfg.img_size,
+                'dataset_name':       eval_cfg_raw['dataset_name'],
+                'callables':          eval_cfg_raw['callables'],
+            },
+            'device': cfg.device,
+            'bf16':   False,
+            'compile': False,
+            'output': {'filename': 'eval_results.txt'},
+        })
+
+        video_dir = Path(swm.data.utils.get_cache_dir('checkpoints')) / cfg.output_model_name
+        eval_metrics = eval_model(eval_cfg, model=model)
+
+        scalar_metrics = {
+            'eval/success_rate':    eval_metrics.get('success_rate', float('nan')),
+            'eval/evaluation_time': eval_metrics.get('evaluation_time', float('nan')),
+        }
+
+        import wandb
+        if wandb.run is not None:
+            # Log scalars
+            wandb.log(scalar_metrics)
+
+            # Log rollout videos — cap at 10 to keep artifact size small
+            videos = sorted(video_dir.glob('env_*.mp4'))
+            successes = eval_metrics.get('episode_successes', [])
+            video_log = {}
+            for i, vid_path in enumerate(videos[:10]):
+                success = bool(successes[i]) if i < len(successes) else None
+                label = 'success' if success else 'fail' if success is not None else 'unknown'
+                video_log[f'eval/rollout_{i:02d}_{label}'] = wandb.Video(
+                    str(vid_path), fps=10, format='mp4'
+                )
+            if video_log:
+                wandb.log(video_log)
+                logging.info(f'Logged {len(video_log)} rollout videos to W&B')
+        else:
+            logging.info(scalar_metrics)
+
+        logging.info(f"Eval success_rate: {eval_metrics.get('success_rate'):.1f}%")
 
 
 if __name__ == '__main__':

@@ -6,14 +6,14 @@ defaults:
 world:
   env_name: swm/TwoRoom-v1
   num_envs: ${eval.num_eval}
-  max_episode_steps: ??? # make sure it's >= eval_budget
+  max_episode_steps: 300  # 2× eval_budget
 seed: 42
-policy: gcbc # ckpt name or random
+policy: lewm_tworoom_expert/weights_epoch_0010.pt
 
 plan_config:
-  horizon: 5
-  receding_horizon: 5
-  action_block: 5 # frameskip
+  horizon: 1
+  receding_horizon: 1
+  action_block: 5  # frameskip
 
 dataset:
   stats: ${eval.dataset_name}
@@ -21,20 +21,18 @@ dataset:
     - action
     - proprio
 
-# evaluation from dataset (replay expert trajectories)
+# Paper Appendix E: TwoRoom evaluation settings
 eval:
   num_eval: 50
-  goal_offset_steps: 25
-  eval_budget: 50
-  img_size: 224
+  goal_offset_steps: 100  # goal sampled 100 steps ahead in trajectory
+  eval_budget: 150         # agent has 150 steps to reach goal
+  img_size: 56             # match training resolution
   dataset_name: tworoom.h5
   callables:
-    # -- set state
     - method: _set_state
       args:
         state:
           value: pos_agent
-    # -- set goal state
     - method: _set_goal_state
       args:
         goal_state:

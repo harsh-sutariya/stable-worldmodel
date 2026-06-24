@@ -109,3 +109,8 @@ loss:
     kwargs:
       knots: 17
       num_proj: 1024
+
+# Post-training pipeline — disabled by default; override per environment
+post_training:
+  run_probe: false
+  run_eval: false

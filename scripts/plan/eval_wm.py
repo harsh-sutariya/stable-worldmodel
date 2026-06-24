@@ -1,9 +1,6 @@
 """Script to evaluate a World Model using MPC on a dataset of episodes."""
 
 import os
-
-os.environ['MUJOCO_GL'] = 'egl'
-
 import time
 from pathlib import Path
 
@@ -51,189 +48,142 @@ def get_dataset(cfg, dataset_name):
     return dataset
 
 
-@hydra.main(version_base=None, config_path='./config', config_name='pusht')
-def run(cfg: DictConfig):
-    """Run evaluation of dinowm vs random policy."""
+def eval_model(cfg: DictConfig, model=None) -> dict:
+    """Run CEM planning evaluation and return metrics dict.
+
+    If model is provided it is used directly (skips load_pretrained).
+    cfg must follow the same structure as the Hydra tworoom/pusht configs.
+    Returns {'success_rate': float, 'episode_successes': array, ...}
+    """
     assert (
         cfg.plan_config.horizon * cfg.plan_config.action_block
         <= cfg.eval.eval_budget
     ), 'Planning horizon must be smaller than or equal to eval_budget'
 
-    # create world environment
     cfg.world.max_episode_steps = 2 * cfg.eval.eval_budget
     world = swm.World(**cfg.world, image_shape=(224, 224))
 
-    # create the transform
     img_dtype = torch.bfloat16 if cfg.get('bf16', False) else torch.float32
     transform = {
         'pixels': img_transform(cfg, img_dtype),
-        'goal': img_transform(cfg, img_dtype),
+        'goal':   img_transform(cfg, img_dtype),
     }
 
-    dataset = get_dataset(cfg, cfg.eval.dataset_name)
-    stats_dataset = dataset  # get_dataset(cfg, cfg.dataset.stats)
-    col_name = (
-        'episode_idx' if 'episode_idx' in dataset.column_names else 'ep_idx'
-    )
-    ep_indices, _ = np.unique(
-        stats_dataset.get_col_data(col_name), return_index=True
-    )
+    dataset     = get_dataset(cfg, cfg.eval.dataset_name)
+    col_name    = 'episode_idx' if 'episode_idx' in dataset.column_names else 'ep_idx'
+    ep_indices, _ = np.unique(dataset.get_col_data(col_name), return_index=True)
 
     process = {}
     for col in cfg.dataset.keys_to_cache:
         if col in ['pixels']:
             continue
         processor = preprocessing.StandardScaler()
-        col_data = stats_dataset.get_col_data(col)
-        col_data = col_data[~np.isnan(col_data).any(axis=1)]
+        col_data  = dataset.get_col_data(col)
+        col_data  = col_data[~np.isnan(col_data).any(axis=1)]
         processor.fit(col_data)
         process[col] = processor
-
         if col != 'action':
             process[f'goal_{col}'] = process[col]
 
-    # -- run evaluation
-    policy = cfg.get('policy', 'random')
+    policy_name = cfg.get('policy', 'random')
+    device      = cfg.get('device', 'cpu')
 
-    if policy != 'random':
-        model = swm.wm.utils.load_pretrained(cfg.policy)
+    if policy_name != 'random':
+        if model is None:
+            model = swm.wm.utils.load_pretrained(cfg.policy)
         if cfg.get('bf16', False):
             model = model.to(torch.bfloat16)
-        model = model.to('cuda')
-        model = model.eval()
+        model = model.to(device).eval()
         model.requires_grad_(False)
         model.interpolate_pos_encoding = True
         if cfg.get('compile', False):
-            encoder_attr = (
-                'backbone' if hasattr(model, 'backbone') else 'encoder'
-            )
-            setattr(
-                model,
-                encoder_attr,
-                torch.compile(getattr(model, encoder_attr)),
-            )
+            encoder_attr = 'backbone' if hasattr(model, 'backbone') else 'encoder'
+            setattr(model, encoder_attr, torch.compile(getattr(model, encoder_attr)))
             model.predictor = torch.compile(model.predictor)
-        config = swm.PlanConfig(**cfg.plan_config)
-        solver = hydra.utils.instantiate(cfg.solver, model=model)
-        policy = swm.policy.WorldModelPolicy(
-            solver=solver, config=config, process=process, transform=transform
+        plan_config = swm.PlanConfig(**cfg.plan_config)
+        solver      = hydra.utils.instantiate(cfg.solver, model=model)
+        policy      = swm.policy.WorldModelPolicy(
+            solver=solver, config=plan_config, process=process, transform=transform
         )
-
     else:
         policy = swm.policy.RandomPolicy()
 
     results_path = (
-        Path(
-            swm.data.utils.get_cache_dir(sub_folder='checkpoints'), cfg.policy
-        ).parent
-        if cfg.policy != 'random'
+        Path(swm.data.utils.get_cache_dir(sub_folder='checkpoints'), cfg.policy).parent
+        if policy_name != 'random'
         else Path(__file__).parent
     )
 
-    # sample the episodes and the starting indices
-    episode_len = get_episodes_length(dataset, ep_indices)
-    max_start_idx = episode_len - cfg.eval.goal_offset_steps - 1
-    max_start_idx_dict = {
-        ep_id: max_start_idx[i] for i, ep_id in enumerate(ep_indices)
-    }
-    # Map each dataset row’s episode_idx to its max_start_idx
-    col_name = (
-        'episode_idx' if 'episode_idx' in dataset.column_names else 'ep_idx'
-    )
+    episode_len    = get_episodes_length(dataset, ep_indices)
+    max_start_idx  = episode_len - cfg.eval.goal_offset_steps - 1
+    max_start_dict = {ep_id: max_start_idx[i] for i, ep_id in enumerate(ep_indices)}
     max_start_per_row = np.array(
-        [max_start_idx_dict[ep_id] for ep_id in dataset.get_col_data(col_name)]
+        [max_start_dict[ep_id] for ep_id in dataset.get_col_data(col_name)]
     )
-
-    # remove all the lines of dataset for which dataset['step_idx'] > max_start_per_row
-    valid_mask = dataset.get_col_data('step_idx') <= max_start_per_row
+    valid_mask    = dataset.get_col_data('step_idx') <= max_start_per_row
     valid_indices = np.nonzero(valid_mask)[0]
     print(valid_mask.sum(), 'valid starting points found for evaluation.')
 
     g = np.random.default_rng(cfg.seed)
-    random_episode_indices = g.choice(
-        len(valid_indices) - 1, size=cfg.eval.num_eval, replace=False
+    random_episode_indices = np.sort(
+        valid_indices[g.choice(len(valid_indices) - 1, size=cfg.eval.num_eval, replace=False)]
     )
 
-    # sort increasingly to avoid issues with HDF5Dataset indexing
-    random_episode_indices = np.sort(valid_indices[random_episode_indices])
-
-    print(random_episode_indices)
-
-    eval_episodes = dataset.get_row_data(random_episode_indices)[col_name]
+    eval_episodes  = dataset.get_row_data(random_episode_indices)[col_name]
     eval_start_idx = dataset.get_row_data(random_episode_indices)['step_idx']
 
     if len(eval_episodes) < cfg.eval.num_eval:
-        raise ValueError(
-            'Not enough episodes with sufficient length for evaluation.'
-        )
+        raise ValueError('Not enough episodes with sufficient length for evaluation.')
 
     world.set_policy(policy)
-
     results_path.mkdir(parents=True, exist_ok=True)
-    print(
-        f'[eval] saving videos to {results_path.resolve()} '
-        '(one env_{i}.mp4 per env)'
-    )
+    print(f'[eval] saving videos to {results_path.resolve()}')
 
-    autocast_ctx = torch.autocast(
-        device_type='cuda',
-        dtype=torch.bfloat16,
-        enabled=cfg.get('bf16', False),
-    )
+    use_bf16       = cfg.get('bf16', False)
+    autocast_device = device if device == 'cuda' else 'cpu'
 
-    if cfg.get('compile', False):
-        print('Warming up compiled model...')
-        warmup_autocast_ctx = torch.autocast(
-            device_type='cuda',
-            dtype=torch.bfloat16,
-            enabled=cfg.get('bf16', False),
-        )
-        with warmup_autocast_ctx:
-            n = world.num_envs
-            world.evaluate(
-                dataset=dataset,
-                start_steps=eval_start_idx.tolist()[:n],
-                goal_offset=cfg.eval.goal_offset_steps,
-                eval_budget=cfg.eval.eval_budget,
-                episodes_idx=eval_episodes.tolist()[:n],
-                callables=OmegaConf.to_container(
-                    cfg.eval.get('callables'), resolve=True
-                ),
-                video=results_path,
-            )
-        print('Warmup done.')
+    callables = OmegaConf.to_container(cfg.eval.get('callables'), resolve=True)
 
     start_time = time.time()
-    with autocast_ctx:
+    with torch.autocast(device_type=autocast_device, dtype=torch.bfloat16, enabled=use_bf16):
         metrics = world.evaluate(
             dataset=dataset,
             start_steps=eval_start_idx.tolist(),
             goal_offset=cfg.eval.goal_offset_steps,
             eval_budget=cfg.eval.eval_budget,
             episodes_idx=eval_episodes.tolist(),
-            callables=OmegaConf.to_container(
-                cfg.eval.get('callables'), resolve=True
-            ),
+            callables=callables,
             video=results_path,
         )
     end_time = time.time()
 
+    metrics['evaluation_time'] = end_time - start_time
     print(metrics)
-    print(f'[eval] videos saved to {results_path.resolve()}')
+    return metrics
 
-    results_path = results_path / cfg.output.filename
-    results_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with results_path.open('a') as f:
-        f.write('\n')  # separate from previous runs
+@hydra.main(version_base=None, config_path='./config', config_name='pusht')
+def run(cfg: DictConfig):
+    """Run evaluation of dinowm vs random policy."""
+    metrics = eval_model(cfg)
 
+    results_path = (
+        Path(swm.data.utils.get_cache_dir(sub_folder='checkpoints'), cfg.policy).parent
+        if cfg.get('policy', 'random') != 'random'
+        else Path(__file__).parent
+    )
+    out_file = results_path / cfg.output.filename
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+
+    with out_file.open('a') as f:
+        f.write('\n')
         f.write('==== CONFIG ====\n')
         f.write(OmegaConf.to_yaml(cfg))
-        f.write('\n')
-
-        f.write('==== RESULTS ====\n')
+        f.write('\n==== RESULTS ====\n')
         f.write(f'metrics: {metrics}\n')
-        f.write(f'evaluation_time: {end_time - start_time} seconds\n')
+        f.write(f'evaluation_time: {metrics.get("evaluation_time")} seconds\n')
+
+    print(f'[eval] results saved to {out_file}')
 
 
 if __name__ == '__main__':

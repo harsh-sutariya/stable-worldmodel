@@ -20,3 +20,54 @@ wm:
 
 trainer:
   max_epochs: 10
+
+# Run probing + CEM planning automatically after training
+post_training:
+  run_probe: true
+  run_eval: true
+
+  probe:
+    dataset_name: tworoom_expert.lance
+    keys_to_load: [pixels, pos_agent, pos_target, distance_to_target, proprio, reward]
+    num_steps: 1
+    frameskip: 1
+    train_split: 0.9
+    seed: 3072
+    ridge_alpha: 1.0
+    batch_size: 512
+    probe_levels: [encoder_cls, encoder_patches, projector]
+    probe_targets: [pos_agent, pos_target, distance_to_target, proprio, reward]
+
+  eval:
+    # Environment
+    env_name: swm/TwoRoom-v1
+    num_envs: 10
+    max_episode_steps: 300
+    seed: 42
+    # CEM solver (Paper Appendix E)
+    solver:
+      _target_: stable_worldmodel.solver.CEMSolver
+      model: ???
+      batch_size: 1
+      num_samples: 300
+      var_scale: 1.0
+      n_steps: 10
+      topk: 30
+    # Planning
+    plan_config:
+      horizon: 1
+      receding_horizon: 1
+      action_block: 5
+    # Evaluation protocol
+    num_eval: 50
+    goal_offset_steps: 100
+    eval_budget: 150
+    dataset_name: tworoom.h5
+    keys_to_cache: [action, proprio]
+    callables:
+      - method: _set_state
+        args:
+          state: {value: pos_agent}
+      - method: _set_goal_state
+        args:
+          goal_state: {value: goal_pos_agent}
