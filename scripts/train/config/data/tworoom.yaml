@@ -1,7 +1,7 @@
 dataset:
   num_steps: ${eval:'${wm.num_preds} + ${wm.history_size}'}
   frameskip: 5
-  name: tworoom.h5
+  name: tworoom.lance
   keys_to_load:
     - pixels
     - action

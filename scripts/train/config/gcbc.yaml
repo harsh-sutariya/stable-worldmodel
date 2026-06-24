@@ -1,18 +1,20 @@
-#output_dir: ./outputs
-
 defaults:
   - launcher: local
   - _self_
 
+hydra:
+  job:
+    chdir: true
 
 output_model_name: dinogcbc
+subdir: ${output_model_name}
 dataset_name: pusht_expert_train.h5
 
 trainer:
   max_epochs: 100
-  strategy: auto #ddp
-  devices: 1
-  accelerator: gpu
+  strategy: auto
+  devices: auto
+  accelerator: auto
   precision: bf16-mixed
 
 batch_size: 128
@@ -53,3 +55,17 @@ proprio_encoder_lr: 1e-4
 encoder_lr: 1e-4
 
 dump_object: True
+
+checkpointing:
+  every_n_epochs: 5
+  save_top_k: 3
+  save_last: true
+
+wandb:
+  enabled: true
+  project: stable-wm
+  entity: null
+  name: ${output_model_name}
+  id: ${subdir}
+  resume: allow
+  log_model: false

@@ -1,11 +1,14 @@
-#output_dir: ./outputs
 defaults:
   - _self_
   - launcher: local
   - data: pusht
 
+hydra:
+  job:
+    chdir: true
+
 output_model_name: pldm
-subdir: ${hydra:job.id}
+subdir: ${output_model_name}
 
 num_workers: 6
 train_split: 0.9
@@ -21,9 +24,23 @@ dump_object: True
 trainer:
   max_epochs: 100
   devices: auto
-  accelerator: gpu
+  accelerator: auto
   precision: bf16
   gradient_clip_val: 1.0
+
+checkpointing:
+  every_n_epochs: 5
+  save_top_k: 3
+  save_last: true
+
+wandb:
+  enabled: true
+  project: stable-wm
+  entity: null
+  name: ${output_model_name}
+  id: ${subdir}
+  resume: allow
+  log_model: false
 
 loader:
   batch_size: 128
