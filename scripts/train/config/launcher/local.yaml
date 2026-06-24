@@ -7,3 +7,10 @@ defaults:
 n_gpus: 1
 cpus_per_task: 8
 cache_dir: null   # uses $STABLEWM_HOME/checkpoints by default
+
+# MPS (Apple Silicon) — reduce memory pressure
+img_size: 56
+num_workers: 2
+loader:
+  prefetch_factor: 2
+  pin_memory: false

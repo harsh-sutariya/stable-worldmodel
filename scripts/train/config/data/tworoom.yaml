@@ -1,11 +1,22 @@
-dataset:
-  num_steps: ${eval:'${wm.num_preds} + ${wm.history_size}'}
-  frameskip: 5
-  name: tworoom.lance
-  keys_to_load:
-    - pixels
-    - action
-    - proprio
-  keys_to_cache:
-    - action
-    - proprio
+# @package _global_
+
+# Dataset settings (namespaced under data.dataset to match cfg.data.dataset in scripts)
+data:
+  dataset:
+    num_steps: ${eval:'${wm.num_preds} + ${wm.history_size}'}
+    frameskip: 5
+    name: tworoom_expert.lance
+    keys_to_load:
+      - pixels
+      - action
+      - proprio
+    keys_to_cache:
+      - action
+      - proprio
+
+# Paper (Appendix D): TwoRoom-specific model and training overrides
+wm:
+  history_size: 1
+
+trainer:
+  max_epochs: 10

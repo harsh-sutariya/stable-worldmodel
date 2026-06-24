@@ -26,7 +26,7 @@ trainer:
   max_epochs: 100
   devices: auto
   accelerator: auto
-  precision: bf16
+  precision: bf16-mixed
   gradient_clip_val: 1.0
 
 checkpointing:
