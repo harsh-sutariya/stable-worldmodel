@@ -1,5 +1,5 @@
 import os
-from pathlib import Path
+from functools import partial
 
 import hydra
 import lightning as pl
@@ -7,70 +7,28 @@ import stable_pretraining as spt
 from stable_pretraining import data as dt
 import stable_worldmodel as swm
 import torch
-from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 from loguru import logger as logging
 from omegaconf import OmegaConf, open_dict
 from torch.utils.data import DataLoader
 
-from functools import partial
-
 from stable_worldmodel.data import column_normalizer as get_column_normalizer
 from stable_worldmodel.wm.loss import PLDMLoss, TemporalStraighteningLoss
-from lightning.pytorch.callbacks import Callback
-from stable_worldmodel.wm.utils import save_pretrained
 
-
-def get_img_preprocessor(source: str, target: str, img_size: int = 224):
-    imagenet_stats = dt.dataset_stats.ImageNet
-    to_image = dt.transforms.ToImage(
-        **imagenet_stats, source=source, target=target
-    )
-    resize = dt.transforms.Resize(img_size, source=source, target=target)
-    return dt.transforms.Compose(to_image, resize)
-
-
-class SaveCkptCallback(Callback):
-    """Callback to save model checkpoint after each epoch using save_pretrained."""
-
-    def __init__(self, run_name, cfg, epoch_interval: int = 1):
-        super().__init__()
-        self.run_name = run_name
-        self.cfg = cfg
-        self.epoch_interval = epoch_interval
-
-    def on_train_epoch_end(self, trainer, pl_module):
-        super().on_train_epoch_end(trainer, pl_module)
-
-        if trainer.is_global_zero:
-            if (trainer.current_epoch + 1) % self.epoch_interval == 0:
-                self._save(pl_module.model, trainer.current_epoch + 1)
-
-            # save final epoch
-            if (trainer.current_epoch + 1) == trainer.max_epochs:
-                self._save(pl_module.model, trainer.current_epoch + 1)
-
-    def _save(self, model, epoch):
-        save_pretrained(
-            model,
-            run_name=self.run_name,
-            config=self.cfg,
-            filename=f'weights_epoch_{epoch}.pt',
-        )
+from utils import SaveCkptCallback, build_wandb_logger, get_img_preprocessor, setup_run_dir
 
 
 def pldm_forward(self, batch, stage, cfg):
-    """encode observations, predict next states, compute losses."""
-    # Replace NaN values with 0 (occurs at sequence boundaries)
+    """Encode observations, predict next states, compute losses."""
     batch['action'] = torch.nan_to_num(batch['action'], 0.0)
 
     output = self.model.encode(batch)
-
-    emb = output['emb']  # (B, T, D)
+    emb = output['emb']       # (B, T, D)
     act_emb = output['act_emb']
 
-    inpt_emb = emb[:, : cfg.wm.history_size]  # (B, T-1, D)
+    inpt_emb = emb[:, : cfg.wm.history_size]
     inpt_act = act_emb[:, : cfg.wm.history_size]
-    tgt_emb = emb[:, cfg.wm.num_preds :]  # (B, T-1, patches, dim)
+    tgt_emb = emb[:, cfg.wm.num_preds:]
     pred_emb = self.model.predict(inpt_emb, inpt_act)
 
     output['idm_emb'] = torch.cat([emb[:, 1:], emb[:, :-1]], dim=-1)
@@ -87,12 +45,11 @@ def pldm_forward(self, batch, stage, cfg):
             continue
         output['loss'] = output['loss'] + v.weight * output[loss_key]
 
-    # log all losses
-    losses_dict = {
-        f'{stage}/{k}': v.detach() for k, v in output.items() if 'loss' in k
-    }
-    self.log_dict(losses_dict, on_step=True, sync_dist=True)
-
+    self.log_dict(
+        {f'{stage}/{k}': v.detach() for k, v in output.items() if 'loss' in k},
+        on_step=True,
+        sync_dist=True,
+    )
     return output
 
 
@@ -105,29 +62,28 @@ def run(cfg):
     dataset_cfg = OmegaConf.to_container(cfg.data.dataset, resolve=True)
     dataset_name = dataset_cfg.pop('name')
     cache_dir = os.environ.get('LOCAL_DATASET_DIR', None)
-    print(
-        f'Loading dataset "{dataset_name}" from {"local cache: " + cache_dir if cache_dir else "default location"}'
+    logging.info(
+        f'Loading dataset "{dataset_name}" from '
+        f'{"local cache: " + cache_dir if cache_dir else "default location"}'
     )
     dataset = swm.data.load_dataset(
         dataset_name, transform=None, cache_dir=cache_dir, **dataset_cfg
     )
-    img_processor = get_img_preprocessor('pixels', 'pixels', cfg.img_size)
 
+    img_processor = get_img_preprocessor('pixels', 'pixels', cfg.img_size)
     extra_transforms = []
     for col in cfg.data.dataset.keys_to_load:
-        if col in ['pixels']:
+        if col == 'pixels':
             continue
-        normalizer = get_column_normalizer(dataset, col, col)
-        extra_transforms.append(normalizer)
+        extra_transforms.append(get_column_normalizer(dataset, col, col))
 
     if hasattr(cfg.data.dataset, 'keys_to_merge'):
         for col in cfg.data.dataset.keys_to_merge:
-            normalizer = get_column_normalizer(dataset, col, col)
-            extra_transforms.append(normalizer)
+            extra_transforms.append(get_column_normalizer(dataset, col, col))
 
     with open_dict(cfg):
         for col in cfg.data.dataset.keys_to_load:
-            if col in ['pixels']:
+            if col == 'pixels':
                 continue
             setattr(cfg.wm, f'{col}_dim', dataset.get_dim(col))
 
@@ -136,21 +92,15 @@ def run(cfg):
         cfg.idm.input_dim = 2 * cfg.wm.embed_dim
         cfg.idm.output_dim = effective_act_dim
 
-    transform = spt.data.transforms.Compose(img_processor, *extra_transforms)
-
-    dataset.transform = transform
+    dataset.transform = spt.data.transforms.Compose(img_processor, *extra_transforms)
 
     rnd_gen = torch.Generator().manual_seed(cfg.seed)
     train_set, val_set = spt.data.random_split(
-        dataset,
-        lengths=[cfg.train_split, 1 - cfg.train_split],
-        generator=rnd_gen,
+        dataset, [cfg.train_split, 1 - cfg.train_split], generator=rnd_gen
     )
 
     train = DataLoader(train_set, **cfg.loader, generator=rnd_gen)
-    val_cfg = {**cfg.loader}
-    val_cfg['shuffle'] = False
-    val_cfg['drop_last'] = False
+    val_cfg = {**cfg.loader, 'shuffle': False, 'drop_last': False}
     val = DataLoader(val_set, **val_cfg)
 
     ##############################
@@ -159,22 +109,13 @@ def run(cfg):
 
     world_model = hydra.utils.instantiate(cfg.model)
     idm = hydra.utils.instantiate(cfg.idm)
-
-    models = {
-        'model': world_model,
-        'idm': idm,
-    }
-
-    losses = {
-        'pldm': PLDMLoss(),
-        'path_straight': TemporalStraighteningLoss(),
-    }
+    models = {'model': world_model, 'idm': idm}
+    losses = {'pldm': PLDMLoss(), 'path_straight': TemporalStraighteningLoss()}
 
     total_steps = cfg.trainer.max_epochs * len(train)
-    optimizers = {}
-    for model_name in models.keys():
-        optimizers[f'{model_name}_opt'] = {
-            'modules': str(model_name),
+    optimizers = {
+        f'{name}_opt': {
+            'modules': name,
             'optimizer': dict(cfg.optimizer),
             'scheduler': {
                 'type': 'LinearWarmupCosineAnnealingLR',
@@ -183,6 +124,8 @@ def run(cfg):
             },
             'interval': 'epoch',
         }
+        for name in models
+    }
 
     data_module = spt.data.DataModule(train=train, val=val)
     world_model = spt.Module(
@@ -196,43 +139,42 @@ def run(cfg):
     ##       training       ##
     ##########################
 
-    run_id = cfg.get('subdir') or ''
-    run_dir = Path(
-        swm.data.utils.get_cache_dir(sub_folder='checkpoints'), run_id
-    )
-    logging.info(f'🫆🫆🫆 Run ID: {run_id} 🫆🫆🫆')
+    run_dir = setup_run_dir(cfg)
+    pl_logger = build_wandb_logger(cfg)
 
-    logger = None
-    if cfg.wandb.enabled:
-        logger = WandbLogger(**cfg.wandb.config)
-        logger.log_hyperparams(OmegaConf.to_container(cfg))
+    last_ckpt = run_dir / 'lightning' / 'last.ckpt'
 
-    run_dir.mkdir(parents=True, exist_ok=True)
-    with open(run_dir / 'config.yaml', 'w') as f:
-        OmegaConf.save(cfg, f)
-
-    object_dump_callback = SaveCkptCallback(
-        run_name=cfg.output_model_name, cfg=cfg, epoch_interval=5
-    )
+    callbacks = [
+        ModelCheckpoint(
+            dirpath=run_dir / 'lightning',
+            filename='epoch={epoch:04d}',
+            monitor='validate/loss',
+            save_top_k=cfg.checkpointing.save_top_k,
+            save_last=cfg.checkpointing.save_last,
+            mode='min',
+            verbose=True,
+        ),
+        LearningRateMonitor(logging_interval='step'),
+        SaveCkptCallback(
+            run_name=cfg.output_model_name,
+            cfg=cfg,
+            every_n_epochs=cfg.checkpointing.every_n_epochs,
+        ),
+    ]
 
     trainer = pl.Trainer(
         **cfg.trainer,
-        callbacks=[object_dump_callback],
+        callbacks=callbacks,
         num_sanity_val_steps=1,
-        logger=logger,
-        enable_checkpointing=True,
+        logger=pl_logger,
     )
 
-    ckpt_path = run_dir / f'{cfg.output_model_name}_weights.ckpt'
-    manager = spt.Manager(
+    spt.Manager(
         trainer=trainer,
         module=world_model,
         data=data_module,
-        ckpt_path=ckpt_path if ckpt_path.exists() else None,
-    )
-
-    manager()
-    return
+        ckpt_path=last_ckpt if last_ckpt.exists() else None,
+    )()
 
 
 if __name__ == '__main__':

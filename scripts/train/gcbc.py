@@ -4,18 +4,18 @@ from collections import OrderedDict
 import hydra
 import lightning as pl
 import stable_pretraining as spt
+import stable_worldmodel as swm
 import torch
-from lightning.pytorch.callbacks import Callback
-from stable_worldmodel.data import column_normalizer as get_column_normalizer
-from stable_worldmodel.wm.utils import save_pretrained
-from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 from loguru import logger as logging
 from omegaconf import OmegaConf
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from transformers import AutoModel
 
-import stable_worldmodel as swm
+from stable_worldmodel.data import column_normalizer as get_column_normalizer
+
+from utils import SaveCkptCallback, build_wandb_logger, setup_run_dir
 
 
 # ============================================================================
@@ -35,8 +35,9 @@ def get_data(cfg):
         )
 
     cache_dir = os.environ.get('LOCAL_DATASET_DIR', None)
-    print(
-        f'Loading dataset "{cfg.dataset_name}" from {"local cache: " + cache_dir if cache_dir else "default location"}'
+    logging.info(
+        f'Loading dataset "{cfg.dataset_name}" from '
+        f'{"local cache: " + cache_dir if cache_dir else "default location"}'
     )
 
     use_proprio = cfg.dinowm.get('use_proprio_encoder', True)
@@ -294,88 +295,48 @@ def get_gcbc_policy(cfg):
 
 
 # ============================================================================
-# Training Setup
-# ============================================================================
-def setup_pl_logger(cfg):
-    if not cfg.wandb.enable:
-        return None
-
-    wandb_run_id = cfg.wandb.get('run_id', None)
-    wandb_logger = WandbLogger(
-        name='dino_gcbc',
-        project=cfg.wandb.project,
-        entity=cfg.wandb.entity,
-        resume='allow' if wandb_run_id else None,
-        id=wandb_run_id,
-        log_model=False,
-    )
-
-    wandb_logger.log_hyperparams(OmegaConf.to_container(cfg))
-    return wandb_logger
-
-
-class SaveCkptCallback(Callback):
-    """Callback to save model checkpoint after each epoch using save_pretrained."""
-
-    def __init__(self, run_name, cfg, epoch_interval: int = 1):
-        super().__init__()
-        self.run_name = run_name
-        self.cfg = cfg
-        self.epoch_interval = epoch_interval
-
-    def on_train_epoch_end(self, trainer, pl_module):
-        super().on_train_epoch_end(trainer, pl_module)
-
-        if trainer.is_global_zero:
-            if (trainer.current_epoch + 1) % self.epoch_interval == 0:
-                self._save(pl_module.model, trainer.current_epoch + 1)
-
-            # save final epoch
-            if (trainer.current_epoch + 1) == trainer.max_epochs:
-                self._save(pl_module.model, trainer.current_epoch + 1)
-
-    def _save(self, model, epoch):
-        save_pretrained(
-            model,
-            run_name=self.run_name,
-            config=self.cfg,
-            filename=f'weights_epoch_{epoch}.pt',
-        )
-
-
-# ============================================================================
 # Main Entry Point
 # ============================================================================
 @hydra.main(version_base=None, config_path='./config', config_name='gcbc')
 def run(cfg):
-    """Run training of predictor"""
-
-    wandb_logger = setup_pl_logger(cfg)
+    pl_logger = build_wandb_logger(cfg)
     data = get_data(cfg)
     gcbc_policy = get_gcbc_policy(cfg)
 
-    cache_dir = swm.data.utils.get_cache_dir(sub_folder='checkpoints')
-    dump_object_callback = SaveCkptCallback(
-        run_name=cfg.output_model_name,
-        cfg=cfg,
-        epoch_interval=3,
-    )
+    run_dir = setup_run_dir(cfg)
+    last_ckpt = run_dir / 'lightning' / 'last.ckpt'
+
+    callbacks = [
+        ModelCheckpoint(
+            dirpath=run_dir / 'lightning',
+            filename='epoch={epoch:04d}',
+            monitor='val/loss',
+            save_top_k=cfg.checkpointing.save_top_k,
+            save_last=cfg.checkpointing.save_last,
+            mode='min',
+            verbose=True,
+        ),
+        LearningRateMonitor(logging_interval='step'),
+        SaveCkptCallback(
+            run_name=cfg.output_model_name,
+            cfg=cfg,
+            every_n_epochs=cfg.checkpointing.every_n_epochs,
+        ),
+    ]
 
     trainer = pl.Trainer(
         **cfg.trainer,
-        callbacks=[dump_object_callback],
+        callbacks=callbacks,
         num_sanity_val_steps=1,
-        logger=wandb_logger,
-        enable_checkpointing=True,
+        logger=pl_logger,
     )
 
-    manager = spt.Manager(
+    spt.Manager(
         trainer=trainer,
         module=gcbc_policy,
         data=data,
-        ckpt_path=f'{cache_dir}/{cfg.output_model_name}_weights.ckpt',
-    )
-    manager()
+        ckpt_path=last_ckpt if last_ckpt.exists() else None,
+    )()
 
 
 if __name__ == '__main__':
