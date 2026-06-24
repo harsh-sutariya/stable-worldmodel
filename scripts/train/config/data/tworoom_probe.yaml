@@ -1,0 +1,15 @@
+# @package _global_
+
+# Single-frame windows for probing (no sequence context needed)
+data:
+  dataset:
+    num_steps: 1
+    frameskip: 1
+    name: tworoom_expert.lance
+    keys_to_load:
+      - pixels
+      - pos_agent
+      - pos_target
+      - distance_to_target
+      - proprio
+      - reward

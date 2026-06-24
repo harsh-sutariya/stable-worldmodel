@@ -55,13 +55,25 @@ class SaveCkptCallback(Callback):
     Distinct from Lightning's ModelCheckpoint (which stores full trainer
     state for resumption). This callback writes the slim weights that
     load_pretrained / AutoCostModel / AutoActionableModel can read.
+
+    If probe_cfg is provided, linear probing is run after each checkpoint
+    save and R² curves are logged to W&B (same global_step x-axis as loss).
     """
 
-    def __init__(self, run_name: str, cfg, every_n_epochs: int = 5):
+    def __init__(
+        self,
+        run_name: str,
+        cfg,
+        every_n_epochs: int = 5,
+        probe_cfg: dict | None = None,
+        device: str = 'cpu',
+    ):
         super().__init__()
         self.run_name = run_name
         self.cfg = cfg
         self.every_n_epochs = every_n_epochs
+        self.probe_cfg = probe_cfg
+        self.device = device
 
     def on_train_epoch_end(self, trainer, pl_module):
         if not trainer.is_global_zero:
@@ -72,5 +84,24 @@ class SaveCkptCallback(Callback):
                 pl_module.model,
                 run_name=self.run_name,
                 config=self.cfg,
+                config_key='model',
                 filename=f'weights_epoch_{epoch:04d}.pt',
             )
+            if self.probe_cfg is not None:
+                self._run_probe(pl_module.model, trainer.global_step)
+
+    def _run_probe(self, model, global_step: int):
+        import wandb
+        from probe import probe_model
+
+        logging.info(f'Running linear probe at step {global_step}...')
+        results = probe_model(model, self.probe_cfg, self.device)
+
+        metrics = {}
+        for level, targets in results.items():
+            for target, v in targets.items():
+                metrics[f'probe/{level}/{target}'] = v['mean']
+
+        if wandb.run is not None:
+            wandb.log(metrics, step=global_step)
+            logging.info(f'Probe metrics logged to W&B ({len(metrics)} keys)')

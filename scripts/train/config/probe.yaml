@@ -1,0 +1,32 @@
+defaults:
+  - _self_
+  - launcher: local
+  - data: tworoom_probe
+
+hydra:
+  job:
+    chdir: true
+
+output_model_name: probe_results
+subdir: ${output_model_name}
+
+model_name: lewm_tworoom_expert/weights_epoch_0010.pt
+
+train_split: 0.9
+seed: 3072
+batch_size: 512
+ridge_alpha: 1.0
+
+# Representations to probe at
+probe_levels:
+  - encoder_cls        # raw CLS token from ViT
+  - encoder_patches    # mean of all patch tokens
+  - projector          # projected CLS (what predictor actually receives)
+
+# State variables to predict
+probe_targets:
+  - pos_agent
+  - pos_target
+  - distance_to_target
+  - proprio
+  - reward
