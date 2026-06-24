@@ -9,6 +9,7 @@ import stable_pretraining as spt
 from stable_pretraining import data as dt
 import stable_worldmodel as swm
 import torch
+import torch.nn.functional as F
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 from loguru import logger as logging
 from omegaconf import OmegaConf, open_dict
@@ -26,7 +27,6 @@ def lejepa_forward(self, batch, stage, cfg):
     """Encode observations, predict next states, compute losses."""
     ctx_len = cfg.wm.history_size
     n_preds = cfg.wm.num_preds
-    lambd = cfg.loss.sigreg.weight
 
     batch['action'] = torch.nan_to_num(batch['action'], 0.0)
 
@@ -39,9 +39,20 @@ def lejepa_forward(self, batch, stage, cfg):
     tgt_emb = emb[:, n_preds:]
     pred_emb = self.model.predict(ctx_emb, ctx_act)
 
-    output['pred_loss'] = (pred_emb - tgt_emb).pow(2).mean()
+    output['pred_loss']   = (pred_emb - tgt_emb).pow(2).mean()
     output['sigreg_loss'] = self.sigreg(emb.transpose(0, 1))
-    output['loss'] = output['pred_loss'] + lambd * output['sigreg_loss']
+    output['loss'] = (
+        output['pred_loss'] + cfg.loss.sigreg.weight * output['sigreg_loss']
+    )
+
+    # IDM: given (emb_t, emb_{t+1}), predict action_t
+    # Forces encoder to retain spatially grounded information
+    idm_cfg = cfg.loss.get('idm', None)
+    if idm_cfg and idm_cfg.get('enabled', False) and hasattr(self, 'idm'):
+        idm_input = torch.cat([emb[:, :-1], emb[:, 1:]], dim=-1)  # (B, T-1, 2D)
+        act_target = batch['action'][:, :-1].float()               # (B, T-1, act_dim)
+        output['idm_loss'] = F.mse_loss(self.idm(idm_input), act_target)
+        output['loss'] = output['loss'] + idm_cfg.weight * output['idm_loss']
 
     self.log_dict(
         {f'{stage}/{k}': v.detach() for k, v in output.items() if 'loss' in k},
@@ -99,10 +110,24 @@ def run(cfg):
 
     world_model = hydra.utils.instantiate(cfg.model)
 
+    # Optionally attach IDM as a separate jointly-trained module
+    modules = {'model': world_model}
+    idm_cfg = cfg.loss.get('idm', None)
+    if idm_cfg and idm_cfg.get('enabled', False):
+        with open_dict(cfg):
+            cfg.idm.input_dim  = 2 * cfg.embed_dim
+            cfg.idm.output_dim = cfg.model.action_encoder.input_dim  # frameskip * act_dim
+        idm = hydra.utils.instantiate(cfg.idm)
+        modules['idm'] = idm
+        logging.info(
+            f'IDM enabled — input_dim={cfg.idm.input_dim}, '
+            f'output_dim={cfg.idm.output_dim}, weight={idm_cfg.weight}'
+        )
+
     total_steps = cfg.trainer.max_epochs * len(train)
     optimizers = {
-        'model_opt': {
-            'modules': 'model',
+        f'{name}_opt': {
+            'modules': name,
             'optimizer': dict(cfg.optimizer),
             'scheduler': {
                 'type': 'LinearWarmupCosineAnnealingLR',
@@ -110,12 +135,13 @@ def run(cfg):
                 'max_steps': total_steps,
             },
             'interval': 'epoch',
-        },
+        }
+        for name in modules
     }
 
     data_module = spt.data.DataModule(train=train, val=val)
     world_model = spt.Module(
-        model=world_model,
+        **modules,
         sigreg=SIGReg(**cfg.loss.sigreg.kwargs),
         forward=partial(lejepa_forward, cfg=cfg),
         optim=optimizers,

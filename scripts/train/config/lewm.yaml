@@ -109,6 +109,16 @@ loss:
     kwargs:
       knots: 17
       num_proj: 1024
+  idm:
+    enabled: true
+    weight: 1.0
+
+# IDM module — instantiated only when loss.idm.enabled is true
+idm:
+  _target_: stable_worldmodel.wm.pldm.module.MLP
+  input_dim: ???     # set at runtime: 2 * embed_dim
+  hidden_dim: 512
+  output_dim: ???    # set at runtime: frameskip * action_dim
 
 # Post-training pipeline — disabled by default; override per environment
 post_training:
