@@ -222,8 +222,15 @@ results/
 wandb/
 videos/
 dataset/
+datasets/
+.hydra/
 *.out
 *.mp4
+*.pt
+*.ckpt
+*.lance
+*.h5
+*.hdf5
 lightning_logs/
 old_tests/
 results/
