@@ -39,9 +39,9 @@ post_training:
     probe_targets: [pos_agent, pos_target, distance_to_target, proprio, reward]
 
   eval:
-    # Environment
+    # Environment — num_envs must equal num_eval (world.evaluate assertion)
     env_name: swm/TwoRoom-v1
-    num_envs: 10
+    num_envs: 50
     max_episode_steps: 300
     seed: 42
     # CEM solver (Paper Appendix E)
