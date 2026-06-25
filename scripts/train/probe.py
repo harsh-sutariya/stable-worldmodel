@@ -171,6 +171,8 @@ def probe_model(model, probe_cfg, device: str) -> dict[str, dict]:
     probe_targets = list(cfg_d['probe_targets'])
     probe_levels  = list(cfg_d['probe_levels'])
 
+    was_training = model.training
+    saved_grad = {n: p.requires_grad for n, p in model.named_parameters()}
     model.eval().requires_grad_(False).to(device)
 
     dataset = swm.data.load_dataset(
@@ -190,38 +192,45 @@ def probe_model(model, probe_cfg, device: str) -> dict[str, dict]:
     val_loader   = DataLoader(val_set,   batch_size=cfg_d.get('batch_size', 512),
                               shuffle=False, num_workers=2, drop_last=False)
 
-    logging.info(f'[probe] encoding {len(train_set):,} train / {len(val_set):,} val frames...')
-    train_embs, train_targets = encode_dataset(model, train_loader, probe_targets, device)
-    val_embs,   val_targets   = encode_dataset(model, val_loader,   probe_targets, device)
+    try:
+        logging.info(f'[probe] encoding {len(train_set):,} train / {len(val_set):,} val frames...')
+        train_embs, train_targets = encode_dataset(model, train_loader, probe_targets, device)
+        val_embs,   val_targets   = encode_dataset(model, val_loader,   probe_targets, device)
 
-    results: dict[str, dict] = {}
-    for level in probe_levels:
-        if level not in train_embs:
-            logging.warning(f'[probe] level {level!r} not found, skipping.')
-            continue
-        logging.info(f'[probe] probing level: {level}')
-        results[level] = probe_level(
-            train_embs[level], val_embs[level],
-            train_targets, val_targets,
-            alpha=cfg_d['ridge_alpha'],
-        )
-
-    # print table
-    col_w = max(len(t) for t in probe_targets) + 2
-    header = f"{'variable':<{col_w}}" + ''.join(f'{l:>18}' for l in probe_levels)
-    sep = '─' * len(header)
-    print(f'\n{sep}\nLinear Probing Results  (R²)\n{sep}')
-    print(header)
-    print(sep)
-    for target in probe_targets:
-        row = f'{target:<{col_w}}'
+        results: dict[str, dict] = {}
         for level in probe_levels:
-            r2 = results.get(level, {}).get(target, {}).get('mean', float('nan'))
-            row += f'{r2:>18.4f}'
-        print(row)
-    print(sep)
+            if level not in train_embs:
+                logging.warning(f'[probe] level {level!r} not found, skipping.')
+                continue
+            logging.info(f'[probe] probing level: {level}')
+            results[level] = probe_level(
+                train_embs[level], val_embs[level],
+                train_targets, val_targets,
+                alpha=cfg_d['ridge_alpha'],
+            )
 
-    return results
+        # print table
+        col_w = max(len(t) for t in probe_targets) + 2
+        header = f"{'variable':<{col_w}}" + ''.join(f'{l:>18}' for l in probe_levels)
+        sep = '─' * len(header)
+        print(f'\n{sep}\nLinear Probing Results  (R²)\n{sep}')
+        print(header)
+        print(sep)
+        for target in probe_targets:
+            row = f'{target:<{col_w}}'
+            for level in probe_levels:
+                r2 = results.get(level, {}).get(target, {}).get('mean', float('nan'))
+                row += f'{r2:>18.4f}'
+            print(row)
+        print(sep)
+
+        return results
+    finally:
+        # Restore model training state so probing mid-training doesn't break backprop
+        for n, p in model.named_parameters():
+            p.requires_grad_(saved_grad.get(n, True))
+        if was_training:
+            model.train()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
