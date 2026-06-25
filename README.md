@@ -24,6 +24,24 @@
 
 ---
 
+## IDM Experiment: Does an Inverse Dynamics Model fix LeWM on TwoRoom?
+
+**Hypothesis.** LeWM's SIGReg loss biases the encoder toward agent motion and ignores goal position. An Inverse Dynamics Model (IDM) — predicting the action between consecutive embeddings — should force spatially grounded representations.
+
+**Setup.** We trained LeWM + IDM (203k-param auxiliary MLP, `concat(emb_t, emb_{t+1}) → action`) jointly on TwoRoom expert data (10 epochs, img_size=56, MPS). IDM is now enabled by default in `lewm.yaml` and adapts to any environment's action space at runtime.
+
+**Results.**
+
+| Metric | LeWM (baseline) | LeWM + IDM |
+|---|---|---|
+| pos_agent R² | 0.999 | 0.999 |
+| **pos_target R²** | **0.077** | **0.077** |
+| CEM success rate | 14% | 16% |
+
+**Conclusion.** The IDM did not improve target encoding. The reason: in TwoRoom, the action between two states depends only on *agent* position — the target location is irrelevant to which action was taken. So the IDM creates no gradient pressure to encode the goal. The fix requires a learning signal that explicitly involves the goal: contrastive goal-conditioning (e.g. CRL, VIP) pairs current states with *future* goal states, directly incentivising the encoder to represent reachability.
+
+---
+
 `stable-worldmodel` provides a single, unified interface for the three stages of world model research — **collecting data**, **training**, and **evaluating with model-predictive control** — across a large suite of standardized environments. It ships with reference implementations of common baselines and planning solvers so research code can stay focused on the contribution that matters: the model and the objective.
 
 ## Installation
