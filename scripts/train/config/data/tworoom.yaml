@@ -41,7 +41,7 @@ post_training:
   eval:
     # Environment
     env_name: swm/TwoRoom-v1
-    num_envs: 10
+    num_envs: 50
     max_episode_steps: 300
     seed: 42
     # CEM solver (Paper Appendix E)
