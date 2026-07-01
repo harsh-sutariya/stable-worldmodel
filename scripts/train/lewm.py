@@ -126,9 +126,10 @@ def run(cfg):
     ##########################
 
     run_dir = setup_run_dir(cfg)
-    pl_logger = build_wandb_logger(cfg)
+    pl_logger = build_wandb_logger(cfg, run_dir)
 
-    last_ckpt = run_dir / 'lightning' / 'last.ckpt'
+    ckpt_dir = run_dir / 'lightning'
+    last_ckpt = ckpt_dir / 'last.ckpt'
 
     pt = cfg.get('post_training', {})
     probe_cfg = None
@@ -137,14 +138,24 @@ def run(cfg):
         probe_cfg['img_size'] = cfg.img_size
 
     callbacks = [
+        # Quality checkpoints — ranked by val/loss, kept for model selection
         ModelCheckpoint(
-            dirpath=run_dir / 'lightning',
+            dirpath=ckpt_dir,
             filename='epoch={epoch:04d}',
             monitor='validate/loss',
             save_top_k=cfg.checkpointing.save_top_k,
-            save_last=cfg.checkpointing.save_last,
+            save_last=False,
             mode='min',
             verbose=True,
+        ),
+        # Resume checkpoint — overwrites last.ckpt every N steps so a
+        # mid-epoch kill loses at most resume_every_n_steps of work
+        ModelCheckpoint(
+            dirpath=ckpt_dir,
+            every_n_train_steps=cfg.checkpointing.resume_every_n_steps,
+            save_top_k=0,
+            save_last=True,
+            enable_version_counter=False,
         ),
         LearningRateMonitor(logging_interval='step'),
         SaveCkptCallback(

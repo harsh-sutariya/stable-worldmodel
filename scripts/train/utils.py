@@ -34,8 +34,15 @@ def setup_run_dir(cfg) -> Path:
     return run_dir
 
 
-def build_wandb_logger(cfg):
-    """Return a WandbLogger if wandb.enabled is true, otherwise None."""
+def build_wandb_logger(cfg, run_dir: Path | None = None):
+    """Return a WandbLogger if wandb.enabled is true, otherwise None.
+
+    If run_dir is provided, the W&B run ID is persisted to
+    <run_dir>/wandb_run_id.txt so that resuming training always
+    continues the exact same W&B run (rather than starting a new one).
+    Delete that file to force a fresh W&B run.
+    """
+    import wandb as _wandb
     from lightning.pytorch.loggers import WandbLogger
 
     if not cfg.wandb.enabled:
@@ -44,6 +51,21 @@ def build_wandb_logger(cfg):
     kwargs = OmegaConf.to_container(cfg.wandb, resolve=True)
     kwargs.pop('enabled')
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
+
+    if run_dir is not None:
+        id_file = run_dir / 'wandb_run_id.txt'
+        if id_file.exists():
+            saved_id = id_file.read_text().strip()
+            kwargs['id'] = saved_id
+            kwargs['resume'] = 'must'
+            logging.info(f'Resuming W&B run {saved_id}')
+        else:
+            new_id = _wandb.util.generate_id()
+            id_file.write_text(new_id)
+            kwargs['id'] = new_id
+            kwargs.pop('resume', None)
+            logging.info(f'Starting new W&B run {new_id}')
+
     pl_logger = WandbLogger(**kwargs)
     pl_logger.log_hyperparams(OmegaConf.to_container(cfg, resolve=True))
     return pl_logger
