@@ -187,6 +187,14 @@ def probe_model(model, probe_cfg, device: str) -> dict[str, dict]:
     train_set, val_set = spt.data.random_split(
         dataset, [cfg_d['train_split'], 1 - cfg_d['train_split']], generator=rng
     )
+
+    # Subsample training set to avoid OOM in Ridge SVD (e.g. PushT has ~2M frames)
+    max_train = cfg_d.get('max_train_samples', None)
+    if max_train is not None and len(train_set) > max_train:
+        indices = torch.randperm(len(train_set), generator=rng)[:max_train].tolist()
+        train_set = torch.utils.data.Subset(train_set, indices)
+        logging.info(f'[probe] subsampled train set to {len(train_set):,} frames (max_train_samples={max_train})')
+
     train_loader = DataLoader(train_set, batch_size=cfg_d.get('batch_size', 512),
                               shuffle=False, num_workers=2, drop_last=False)
     val_loader   = DataLoader(val_set,   batch_size=cfg_d.get('batch_size', 512),
