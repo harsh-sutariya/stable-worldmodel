@@ -45,7 +45,7 @@ post_training:
       batch_size: 1
       num_samples: 300
       var_scale: 1.0
-      n_steps: 10
+      n_steps: 30
       topk: 30
     # Planning
     plan_config:
