@@ -9,6 +9,7 @@ import stable_pretraining as spt
 from stable_pretraining import data as dt
 import stable_worldmodel as swm
 import torch
+import torch.nn.functional as F
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 from loguru import logger as logging
 from omegaconf import OmegaConf, open_dict
@@ -27,6 +28,7 @@ def lejepa_forward(self, batch, stage, cfg):
     ctx_len = cfg.wm.history_size
     n_preds = cfg.wm.num_preds
     lambd = cfg.loss.sigreg.weight
+    lambd_curv = cfg.loss.get('curv', {}).get('weight', 0.0)
 
     batch['action'] = torch.nan_to_num(batch['action'], 0.0)
 
@@ -41,7 +43,20 @@ def lejepa_forward(self, batch, stage, cfg):
 
     output['pred_loss'] = (pred_emb - tgt_emb).pow(2).mean()
     output['sigreg_loss'] = self.sigreg(emb.transpose(0, 1))
-    output['loss'] = output['pred_loss'] + lambd * output['sigreg_loss']
+
+    # Temporal straightening: penalise curvature of encoder trajectories.
+    # vel: (B, T-1, D) — consecutive displacement vectors in latent space
+    # curv: 1 - cos(v_t, v_{t+1}) averaged over all consecutive velocity pairs
+    vel = emb[:, 1:, :] - emb[:, :-1, :]                                   # (B, T-1, D)
+    cos_sim = F.cosine_similarity(vel[:, :-1, :], vel[:, 1:, :],
+                                  dim=-1, eps=1e-6)                          # (B, T-2)
+    output['curv_loss'] = (1.0 - cos_sim).mean()
+
+    output['loss'] = (
+        output['pred_loss']
+        + lambd * output['sigreg_loss']
+        + lambd_curv * output['curv_loss']
+    )
 
     self.log_dict(
         {f'{stage}/{k}': v.detach() for k, v in output.items() if 'loss' in k},
