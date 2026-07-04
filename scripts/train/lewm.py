@@ -30,6 +30,8 @@ def lejepa_forward(self, batch, stage, cfg):
     lambd = cfg.loss.sigreg.weight
     lambd_curv  = cfg.loss.get('curv',  {}).get('weight', 0.0)
     lambd_speed = cfg.loss.get('speed', {}).get('weight', 0.0)
+    lambd_agir  = cfg.loss.get('agir',  {}).get('weight', 0.0)
+    sigma_act   = cfg.loss.get('agir',  {}).get('sigma_act', 1.0)
 
     batch['action'] = torch.nan_to_num(batch['action'], 0.0)
 
@@ -52,16 +54,29 @@ def lejepa_forward(self, batch, stage, cfg):
     cos_sim = F.cosine_similarity(vel[:, :-1, :], vel[:, 1:, :],
                                   dim=-1, eps=1e-6)                          # (B, T-2)
     output['curv_loss']  = (1.0 - cos_sim).mean()
-    # Penalise latent speed directly: closes the SIGReg/curv loophole where
-    # the network satisfies variance by inflating ‖v_t‖ (giant helices) rather
-    # than through genuine state diversity.
+
+    # Global speed penalty (disabled when AGIR is active; kept for ablations).
     output['speed_loss'] = vel.norm(p=2, dim=-1).mean()
+
+    # Action-Gated Isometric Representation (AGIR):
+    # gate(Δa_t) = exp(-‖Δa_t‖₂ / σ_act)
+    #   → 1 when actions are static (full speed penalty, kills free-space helices)
+    #   → 0 when actions change sharply (gate opens, allows latent leaps at contacts)
+    # This resolves the SIGReg/L_speed contradiction: the network can satisfy SIGReg
+    # through high-velocity latent jumps precisely at physical events, while keeping
+    # free-space trajectories tightly compressed.
+    delta_act  = batch['action'][:, 1:] - batch['action'][:, :-1]          # (B, T-1, A)
+    act_change = delta_act.norm(p=2, dim=-1).detach()                       # (B, T-1)
+    gate       = torch.exp(-act_change / sigma_act)                         # (B, T-1) ∈ (0,1]
+    lat_speed  = vel.norm(p=2, dim=-1)                                      # (B, T-1)
+    output['agir_loss'] = (gate * lat_speed).mean()
 
     output['loss'] = (
         output['pred_loss']
         + lambd       * output['sigreg_loss']
         + lambd_curv  * output['curv_loss']
         + lambd_speed * output['speed_loss']
+        + lambd_agir  * output['agir_loss']
     )
 
     self.log_dict(
