@@ -28,7 +28,8 @@ def lejepa_forward(self, batch, stage, cfg):
     ctx_len = cfg.wm.history_size
     n_preds = cfg.wm.num_preds
     lambd = cfg.loss.sigreg.weight
-    lambd_curv = cfg.loss.get('curv', {}).get('weight', 0.0)
+    lambd_curv  = cfg.loss.get('curv',  {}).get('weight', 0.0)
+    lambd_speed = cfg.loss.get('speed', {}).get('weight', 0.0)
 
     batch['action'] = torch.nan_to_num(batch['action'], 0.0)
 
@@ -50,12 +51,17 @@ def lejepa_forward(self, batch, stage, cfg):
     vel = emb[:, 1:, :] - emb[:, :-1, :]                                   # (B, T-1, D)
     cos_sim = F.cosine_similarity(vel[:, :-1, :], vel[:, 1:, :],
                                   dim=-1, eps=1e-6)                          # (B, T-2)
-    output['curv_loss'] = (1.0 - cos_sim).mean()
+    output['curv_loss']  = (1.0 - cos_sim).mean()
+    # Penalise latent speed directly: closes the SIGReg/curv loophole where
+    # the network satisfies variance by inflating ‖v_t‖ (giant helices) rather
+    # than through genuine state diversity.
+    output['speed_loss'] = vel.norm(p=2, dim=-1).mean()
 
     output['loss'] = (
         output['pred_loss']
-        + lambd * output['sigreg_loss']
-        + lambd_curv * output['curv_loss']
+        + lambd       * output['sigreg_loss']
+        + lambd_curv  * output['curv_loss']
+        + lambd_speed * output['speed_loss']
     )
 
     self.log_dict(

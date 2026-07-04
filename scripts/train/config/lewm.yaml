@@ -109,6 +109,8 @@ loss:
       num_proj: 1024
   curv:
     weight: 0.01   # λ_curv: temporal straightening (Wang et al. 2026)
+  speed:
+    weight: 0.01   # λ_speed: latent velocity bound — prevents SIGReg/curv loophole
 
 # Post-training pipeline — disabled by default; override per environment
 post_training:
