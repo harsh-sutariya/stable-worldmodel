@@ -61,6 +61,8 @@ def parse_args():
     p.add_argument('--contact-thresh', type=float, default=CONTACT_THRESH)
     p.add_argument('--out-dir',       type=Path,
                    default=Path(ROOT) / 'outputs' / 'latent_geometry')
+    p.add_argument('--level', default='cls', choices=['cls', 'projector'],
+                   help='Embedding level to measure: cls (raw ViT) or projector (what CEM uses)')
     return p.parse_args()
 
 
@@ -118,9 +120,13 @@ def extract_embeddings(model, args):
         enc_out = model.encoder(flat)          # HF BaseModelOutputWithPooling
         hs      = enc_out.last_hidden_state    # (B*T, N_patches+1, D)
         cls     = hs[:, 0, :]                 # CLS token  (B*T, D)
-        cls     = cls.view(B, T, -1).cpu().float()
+        if getattr(args, 'level', 'cls') == 'projector':
+            emb = model.projector(cls)         # projected CLS — what CEM plans in
+        else:
+            emb = cls
+        emb = emb.view(B, T, -1).cpu().float()
 
-        Z_list.append(cls.numpy())
+        Z_list.append(emb.numpy())
         S_list.append(state.numpy())
 
         collected += B
