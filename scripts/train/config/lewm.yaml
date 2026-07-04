@@ -110,7 +110,10 @@ loss:
   curv:
     weight: 0.01   # λ_curv: temporal straightening (Wang et al. 2026)
   speed:
-    weight: 0.01   # λ_speed: latent velocity bound — prevents SIGReg/curv loophole
+    weight: 0.0    # λ_speed: disabled — replaced by AGIR (global penalty destroys kinematic mapping)
+  agir:
+    weight: 0.01   # λ_agir: Action-Gated Isometric Representation
+    sigma_act: 1.0 # gate bandwidth in normalised action space; exp(-‖Δa‖/σ)
 
 # Post-training pipeline — disabled by default; override per environment
 post_training:
