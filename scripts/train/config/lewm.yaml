@@ -58,9 +58,11 @@ optimizer:
 wm:
   history_size: 3
   num_preds: 1
+  w_dim: 0              # LV-JEPA uncertainty dimension; 0 = disabled
 
 model:
   _target_: stable_worldmodel.wm.lewm.LeWM
+  inference_net: null   # populated when w_dim > 0
   encoder:
     _target_: stable_pretraining.backbone.utils.vit_hf
     size: ${encoder_scale}
@@ -74,6 +76,7 @@ model:
     input_dim: ${embed_dim}
     hidden_dim: ${embed_dim}
     output_dim: ${embed_dim}
+    cond_input_dim: ${eval:'${embed_dim} + ${wm.w_dim}'}
     depth: 6
     heads: 16
     mlp_dim: 2048
@@ -114,6 +117,11 @@ loss:
   agir:
     weight: 0.01   # λ_agir: Action-Gated Isometric Representation
     sigma_act: 1.0 # gate bandwidth in normalised action space; exp(-‖Δa‖/σ)
+
+  lvjepa:
+    beta_start: 0.0    # β anneals from here (disabled) …
+    beta_end: 0.0      # … to here; set > 0 to enable LV-JEPA
+    anneal_epochs: 5   # number of epochs for linear β warmup
 
 # Post-training pipeline — disabled by default; override per environment
 post_training:

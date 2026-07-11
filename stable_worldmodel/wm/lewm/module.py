@@ -134,6 +134,7 @@ class Transformer(nn.Module):
         mlp_dim,
         dropout=0.0,
         block_class=Block,
+        cond_input_dim=None,
     ):
         super().__init__()
         self.norm = nn.LayerNorm(hidden_dim)
@@ -145,9 +146,10 @@ class Transformer(nn.Module):
             else nn.Identity()
         )
 
+        cond_dim = cond_input_dim if cond_input_dim is not None else input_dim
         self.cond_proj = (
-            nn.Linear(input_dim, hidden_dim)
-            if input_dim != hidden_dim
+            nn.Linear(cond_dim, hidden_dim)
+            if cond_dim != hidden_dim
             else nn.Identity()
         )
 
@@ -239,6 +241,53 @@ class MLP(nn.Module):
         return self.net(x)
 
 
+class InferenceNet(nn.Module):
+    """Posterior q_φ(w_t | z_t, a_t, z_{t+1}) for LV-JEPA.
+
+    Maps the triplet (current state, action embedding, next state) into a
+    distribution over the uncertainty variable w ∈ R^w_dim.  The bottleneck
+    (w_dim << z_dim) is the structural guard against posterior collapse — it
+    physically prevents the network from stuffing all of z_{t+1} into w.
+    """
+
+    def __init__(
+        self,
+        z_dim: int,
+        act_dim: int,
+        w_dim: int,
+        hidden_dim: int = 256,
+    ):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(z_dim * 2 + act_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+        )
+        self.mu_head     = nn.Linear(hidden_dim, w_dim)
+        self.logvar_head = nn.Linear(hidden_dim, w_dim)
+
+    @property
+    def w_dim(self) -> int:
+        return self.mu_head.out_features
+
+    def forward(
+        self,
+        z_t:   torch.Tensor,
+        act_t: torch.Tensor,
+        z_t1:  torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        z_t, z_t1 : (B, T, D)
+        act_t      : (B, T, A)
+        Returns (mu_w, logvar_w), each (B, T, W).
+        """
+        x = torch.cat([z_t, act_t, z_t1], dim=-1)
+        h = self.net(x)
+        return self.mu_head(h), self.logvar_head(h)
+
+
 class Predictor(nn.Module):
     """Autoregressive predictor for next-step embedding prediction."""
 
@@ -252,6 +301,7 @@ class Predictor(nn.Module):
         input_dim,
         hidden_dim,
         output_dim=None,
+        cond_input_dim=None,
         dim_head=64,
         dropout=0.0,
         emb_dropout=0.0,
@@ -280,6 +330,7 @@ class Predictor(nn.Module):
             mlp_dim,
             dropout,
             block_class=ConditionalBlock,
+            cond_input_dim=cond_input_dim,
         )
 
     def forward(self, x, c):

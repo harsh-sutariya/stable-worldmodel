@@ -12,6 +12,7 @@ class LeWM(nn.Module):
         action_encoder,
         projector=None,
         pred_proj=None,
+        inference_net=None,
         **kwargs,
     ):
         super().__init__()
@@ -21,6 +22,7 @@ class LeWM(nn.Module):
         self.action_encoder = action_encoder
         self.projector = projector or nn.Identity()
         self.pred_proj = pred_proj or nn.Identity()
+        self.inference_net = inference_net  # None when LV-JEPA is disabled
 
     def encode(self, info):
         """Encode observations and actions into embeddings.
@@ -41,12 +43,14 @@ class LeWM(nn.Module):
 
         return info
 
-    def predict(self, emb, act_emb):
-        """Predict next state embedding
-        emb: (B, T, D)
+    def predict(self, emb, act_emb, w=None):
+        """Predict next state embedding.
+        emb:     (B, T, D)
         act_emb: (B, T, A_emb)
+        w:       (B, T, W_dim) or None  — uncertainty variable from LV-JEPA
         """
-        preds = self.predictor(emb, act_emb)
+        cond = torch.cat([act_emb, w], dim=-1) if w is not None else act_emb
+        preds = self.predictor(emb, cond)
         preds = self.pred_proj(rearrange(preds, 'b t d -> (b t) d'))
         preds = rearrange(preds, '(b t) d -> b t d', b=emb.size(0))
         return preds
@@ -89,15 +93,38 @@ class LeWM(nn.Module):
             torch.cat([act_flat, act_future_flat], dim=1)
         )  # (BS, T, A_emb)
 
+        # LV-CEM: pre-sample one w per future step from the prior N(0, I).
+        # Each of the 300 CEM candidates gets its own independent w sequence,
+        # so CEM searches the joint space of (actions × environmental outcomes).
+        BS = B * S
+        device = all_act_emb.device
+        has_lv = self.inference_net is not None
+        if has_lv:
+            w_dim = self.inference_net.w_dim
+            w_seq = torch.randn(
+                BS, n_steps + 1, w_dim,
+                device=device, dtype=all_act_emb.dtype,
+            )  # (BS, n_steps+1, W)
+
         # rollout predictor autoregressively for n_steps + 1 (final) steps
         # emb_list holds individual (BS, D) frames, each with its own grad_fn
         HS = history_size
         emb_list = list(emb_init.unbind(dim=1))  # H tensors of shape (BS, D)
         for t in range(n_steps + 1):
             lo = max(0, H + t - HS)
-            emb_trunc = torch.stack(emb_list[lo:], dim=1)  # (BS, HS, D)
-            act_trunc = all_act_emb[:, lo : H + t]  # (BS, HS, A_emb)
-            emb_list.append(self.predict(emb_trunc, act_trunc)[:, -1])
+            emb_trunc = torch.stack(emb_list[lo:], dim=1)  # (BS, TS, D)
+            act_trunc = all_act_emb[:, lo : H + t]          # (BS, TS, A_emb)
+
+            if has_lv:
+                # Inject w_t only at the last (current) position in the window;
+                # history positions are padded with zeros (prior mean).
+                TS = act_trunc.size(1)
+                w_pad = torch.zeros(BS, TS, w_dim, device=device,
+                                    dtype=all_act_emb.dtype)
+                w_pad[:, -1] = w_seq[:, t]
+                emb_list.append(self.predict(emb_trunc, act_trunc, w_pad)[:, -1])
+            else:
+                emb_list.append(self.predict(emb_trunc, act_trunc)[:, -1])
 
         emb = torch.stack(emb_list, dim=1)  # (BS, H + n_steps + 1, D)
 

@@ -27,49 +27,63 @@ def lejepa_forward(self, batch, stage, cfg):
     """Encode observations, predict next states, compute losses."""
     ctx_len = cfg.wm.history_size
     n_preds = cfg.wm.num_preds
-    lambd = cfg.loss.sigreg.weight
+    lambd       = cfg.loss.sigreg.weight
     lambd_curv  = cfg.loss.get('curv',  {}).get('weight', 0.0)
     lambd_speed = cfg.loss.get('speed', {}).get('weight', 0.0)
     lambd_agir  = cfg.loss.get('agir',  {}).get('weight', 0.0)
     sigma_act   = cfg.loss.get('agir',  {}).get('sigma_act', 1.0)
 
+    # LV-JEPA: β-KL annealing — linear warmup from beta_start to beta_end
+    lv_cfg      = cfg.loss.get('lvjepa', {})
+    beta_start  = lv_cfg.get('beta_start', 0.0)
+    beta_end    = lv_cfg.get('beta_end',   0.0)
+    anneal_epochs = max(1, lv_cfg.get('anneal_epochs', 1))
+    frac        = min(1.0, getattr(self, 'current_epoch', 0) / anneal_epochs)
+    beta        = beta_start + frac * (beta_end - beta_start)
+
     batch['action'] = torch.nan_to_num(batch['action'], 0.0)
 
     output = self.model.encode(batch)
-    emb = output['emb']       # (B, T, D)
-    act_emb = output['act_emb']
+    emb     = output['emb']      # (B, T, D)
+    act_emb = output['act_emb']  # (B, T, A)
 
-    ctx_emb = emb[:, :ctx_len]
-    ctx_act = act_emb[:, :ctx_len]
-    tgt_emb = emb[:, n_preds:]
-    pred_emb = self.model.predict(ctx_emb, ctx_act)
+    ctx_emb = emb[:, :ctx_len]       # (B, ctx, D)  — z_0 … z_{ctx-1}
+    ctx_act = act_emb[:, :ctx_len]   # (B, ctx, A)
+    tgt_emb = emb[:, n_preds:]       # (B, ctx, D)  — z_1 … z_{ctx}
 
-    output['pred_loss'] = (pred_emb - tgt_emb).pow(2).mean()
     output['sigreg_loss'] = self.sigreg(emb.transpose(0, 1))
 
-    # Temporal straightening: penalise curvature of encoder trajectories.
-    # vel: (B, T-1, D) — consecutive displacement vectors in latent space
-    # curv: 1 - cos(v_t, v_{t+1}) averaged over all consecutive velocity pairs
-    vel = emb[:, 1:, :] - emb[:, :-1, :]                                   # (B, T-1, D)
+    # Temporal straightening
+    vel     = emb[:, 1:, :] - emb[:, :-1, :]                         # (B, T-1, D)
     cos_sim = F.cosine_similarity(vel[:, :-1, :], vel[:, 1:, :],
-                                  dim=-1, eps=1e-6)                          # (B, T-2)
+                                  dim=-1, eps=1e-6)                    # (B, T-2)
     output['curv_loss']  = (1.0 - cos_sim).mean()
-
-    # Global speed penalty (disabled when AGIR is active; kept for ablations).
     output['speed_loss'] = vel.norm(p=2, dim=-1).mean()
 
-    # Action-Gated Isometric Representation (AGIR):
-    # gate(Δa_t) = exp(-‖Δa_t‖₂ / σ_act)
-    #   → 1 when actions are static (full speed penalty, kills free-space helices)
-    #   → 0 when actions change sharply (gate opens, allows latent leaps at contacts)
-    # This resolves the SIGReg/L_speed contradiction: the network can satisfy SIGReg
-    # through high-velocity latent jumps precisely at physical events, while keeping
-    # free-space trajectories tightly compressed.
-    delta_act  = batch['action'][:, 1:] - batch['action'][:, :-1]          # (B, T-1, A)
-    act_change = delta_act.norm(p=2, dim=-1).detach()                       # (B, T-1)
-    gate       = torch.exp(-act_change / sigma_act)                         # (B, T-1) ∈ (0,1]
-    lat_speed  = vel.norm(p=2, dim=-1)                                      # (B, T-1)
+    # AGIR gate: opens speed penalty at physical contact events
+    delta_act  = batch['action'][:, 1:] - batch['action'][:, :-1]    # (B, T-1, A)
+    act_change = delta_act.norm(p=2, dim=-1).detach()                  # (B, T-1)
+    gate       = torch.exp(-act_change / sigma_act)                    # (B, T-1) ∈ (0,1]
+    lat_speed  = vel.norm(p=2, dim=-1)                                 # (B, T-1)
     output['agir_loss'] = (gate * lat_speed).mean()
+
+    # LV-JEPA: posterior inference + reparameterisation trick
+    # Disabled when inference_net is absent (standard LeWM / AGIR runs).
+    w = None
+    output['kl_loss'] = torch.zeros(1, device=emb.device)
+    if self.model.inference_net is not None and beta_end > 0.0:
+        # q_φ(w_t | z_t, a_t, z_{t+1}) for each step in the context window
+        mu_w, logvar_w = self.model.inference_net(ctx_emb, ctx_act, tgt_emb)
+        eps = torch.randn_like(mu_w)
+        w   = mu_w + (0.5 * logvar_w).exp() * eps     # (B, ctx, W)
+
+        # Analytical KL(N(μ,σ²) || N(0,I)) = 0.5 * Σ(-1 - logvar + exp(logvar) + μ²)
+        output['kl_loss'] = (
+            0.5 * (-1.0 - logvar_w + logvar_w.exp() + mu_w.pow(2)).mean()
+        )
+
+    pred_emb = self.model.predict(ctx_emb, ctx_act, w)
+    output['pred_loss'] = (pred_emb - tgt_emb).pow(2).mean()
 
     output['loss'] = (
         output['pred_loss']
@@ -77,13 +91,14 @@ def lejepa_forward(self, batch, stage, cfg):
         + lambd_curv  * output['curv_loss']
         + lambd_speed * output['speed_loss']
         + lambd_agir  * output['agir_loss']
+        + beta        * output['kl_loss']
     )
 
     self.log_dict(
         {f'{stage}/{k}': v.detach() for k, v in output.items() if 'loss' in k},
-        on_step=True,
-        sync_dist=True,
+        on_step=True, sync_dist=True,
     )
+    self.log(f'{stage}/kl_beta', beta, on_step=True, sync_dist=True)
     return output
 
 
