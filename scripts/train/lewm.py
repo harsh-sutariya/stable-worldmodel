@@ -84,6 +84,28 @@ def lejepa_forward(self, batch, stage, cfg):
             0.5 * (-1.0 - logvar_w + logvar_w.exp() + mu_w.pow(2)).mean()
         )
 
+        # Posterior health diagnostics — logged separately from losses
+        with torch.no_grad():
+            # KL per latent dimension: (W,) — reveals which dims carry information
+            kl_per_dim = 0.5 * (
+                -1.0 - logvar_w + logvar_w.exp() + mu_w.pow(2)
+            ).mean(dim=(0, 1))                                    # (W,)
+            sigma_w = (0.5 * logvar_w).exp()
+
+            lv_diag = {
+                # Number of dims with KL > 0.1 nats: tracks bottleneck utilisation
+                f'{stage}/w_active_dims': (kl_per_dim > 0.1).sum().float(),
+                # Mean posterior σ: near 1.0 = prior collapse, near 0 = overfit
+                f'{stage}/w_sigma_mean': sigma_w.mean(),
+                # Mean posterior ‖μ‖: should stay near 0 under KL pressure
+                f'{stage}/w_mu_norm': mu_w.norm(p=2, dim=-1).mean(),
+            }
+            # Per-dimension KL: fingerprint of which dims are active
+            for i, kl_d in enumerate(kl_per_dim):
+                lv_diag[f'{stage}/w_kl_dim_{i}'] = kl_d
+
+        self.log_dict(lv_diag, on_step=True, sync_dist=True)
+
     pred_emb = self.model.predict(ctx_emb, ctx_act, w)
     output['pred_loss'] = (pred_emb - tgt_emb).pow(2).mean()
 
