@@ -1,0 +1,22 @@
+defaults:
+  - lewm          # inherit everything from base config
+  - _self_        # this file's keys win over lewm defaults
+
+output_model_name: lewm_lvjepa_pusht
+
+wm:
+  w_dim: 8        # uncertainty bottleneck dimension; drives cond_input_dim interpolation
+
+model:
+  inference_net:
+    _target_: stable_worldmodel.wm.lewm.module.InferenceNet
+    z_dim: ${embed_dim}       # 192
+    act_dim: ${embed_dim}     # 192 — InferenceNet receives action embedding, not raw action
+    w_dim: ${wm.w_dim}        # 8
+    hidden_dim: 256
+
+loss:
+  lvjepa:
+    beta_start: 0.0
+    beta_end: 0.01            # β target after annealing
+    anneal_epochs: 5          # linear warmup; free channel for first 5 epochs
