@@ -67,11 +67,13 @@ def lejepa_forward(self, batch, stage, cfg):
     lat_speed  = vel.norm(p=2, dim=-1)                                 # (B, T-1)
     output['agir_loss'] = (gate * lat_speed).mean()
 
-    # LV-JEPA: posterior inference + reparameterisation trick
-    # Disabled when inference_net is absent (standard LeWM / AGIR runs).
+    # LV-JEPA: posterior inference + reparameterisation trick.
+    # w is computed whenever inference_net exists — cond_proj is sized for
+    # concat(act_emb, w) and would crash if w=None but w_dim > 0.
+    # The KL weight beta handles "on/off"; model structure does not.
     w = None
     output['kl_loss'] = torch.zeros(1, device=emb.device)
-    if self.model.inference_net is not None and beta_end > 0.0:
+    if self.model.inference_net is not None:
         # q_φ(w_t | z_t, a_t, z_{t+1}) for each step in the context window
         mu_w, logvar_w = self.model.inference_net(ctx_emb, ctx_act, tgt_emb)
         eps = torch.randn_like(mu_w)
