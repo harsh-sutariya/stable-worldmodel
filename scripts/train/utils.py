@@ -2,11 +2,25 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 from lightning.pytorch.callbacks import Callback
 from loguru import logger as logging
 from omegaconf import OmegaConf
+
+
+def _git_info() -> dict[str, str]:
+    """Return current git branch and short commit hash, or empty strings on failure."""
+    def _run(cmd):
+        try:
+            return subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode().strip()
+        except Exception:
+            return ''
+    return {
+        'git_branch': _run(['git', 'rev-parse', '--abbrev-ref', 'HEAD']),
+        'git_commit': _run(['git', 'rev-parse', '--short', 'HEAD']),
+    }
 
 import stable_worldmodel as swm
 from stable_worldmodel.wm.utils import save_pretrained
@@ -68,6 +82,7 @@ def build_wandb_logger(cfg, run_dir: Path | None = None):
 
     pl_logger = WandbLogger(**kwargs)
     pl_logger.log_hyperparams(OmegaConf.to_container(cfg, resolve=True))
+    pl_logger.log_hyperparams(_git_info())
     return pl_logger
 
 
