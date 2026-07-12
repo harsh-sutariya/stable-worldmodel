@@ -4,6 +4,9 @@ defaults:
 
 output_model_name: lewm_lvjepa_pusht
 
+trainer:
+  max_epochs: 10        # match AGIR budget for fair comparison
+
 wm:
   w_dim: 8        # uncertainty bottleneck dimension; drives cond_input_dim interpolation
 
