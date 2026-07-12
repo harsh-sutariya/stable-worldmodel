@@ -28,7 +28,8 @@ class LeWM(nn.Module):
         """Encode observations and actions into embeddings.
         info: dict with pixels and action keys
         """
-        pixels = info['pixels'].to(next(self.encoder.parameters()).dtype)
+        _enc_p = next(self.encoder.parameters())
+        pixels = info['pixels'].to(device=_enc_p.device, dtype=_enc_p.dtype)
         b = pixels.size(0)
         pixels = rearrange(
             pixels, 'b t ... -> (b t) ...'
@@ -39,7 +40,9 @@ class LeWM(nn.Module):
         info['emb'] = rearrange(emb, '(b t) d -> b t d', b=b)
 
         if 'action' in info:
-            info['act_emb'] = self.action_encoder(info['action'])
+            _act_p = next(self.action_encoder.parameters())
+            action = info['action'].to(device=_act_p.device, dtype=_act_p.dtype)
+            info['act_emb'] = self.action_encoder(action)
 
         return info
 
@@ -86,11 +89,15 @@ class LeWM(nn.Module):
             )
 
         # flatten batch and sample dimensions for rollout
+        _ae_p = next(self.action_encoder.parameters())
         emb_init = rearrange(info['emb'], 'b s ... -> (b s) ...')
         act_flat = rearrange(act_0, 'b s ... -> (b s) ...')
         act_future_flat = rearrange(act_future, 'b s ... -> (b s) ...')
+        act_cat = torch.cat([act_flat, act_future_flat], dim=1).to(
+            device=_ae_p.device, dtype=_ae_p.dtype
+        )
         all_act_emb = self.action_encoder(
-            torch.cat([act_flat, act_future_flat], dim=1)
+            act_cat
         )  # (BS, T, A_emb)
 
         # LV-CEM: pre-sample one w per future step from the prior N(0, I).

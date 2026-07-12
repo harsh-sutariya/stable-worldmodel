@@ -101,7 +101,7 @@ def eval_model(cfg: DictConfig, model=None) -> dict:
             setattr(model, encoder_attr, torch.compile(getattr(model, encoder_attr)))
             model.predictor = torch.compile(model.predictor)
         plan_config = swm.PlanConfig(**cfg.plan_config)
-        solver      = hydra.utils.instantiate(cfg.solver, model=model)
+        solver      = hydra.utils.instantiate(cfg.solver, model=model, device=device)
         policy      = swm.policy.WorldModelPolicy(
             solver=solver, config=plan_config, process=process, transform=transform
         )
