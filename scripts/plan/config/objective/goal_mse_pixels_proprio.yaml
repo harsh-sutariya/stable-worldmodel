@@ -1,0 +1,22 @@
+# Goal MSE for a split latent with pixels + proprio (PreJEPA / dinowm-pusht).
+#
+# PreJEPA fuses the pixel embedding with one embedding per extra encoder along
+# the feature axis, so the fused tensor cannot be scored against a goal: it
+# carries action slots, which a goal does not prescribe. Score each source
+# separately and sum the terms.
+#
+# The term order (proprio, then pixels) and `reduction: mean` together
+# reproduce the former PreJEPA.criterion exactly. Adjust the leading floats to
+# trade the sources off against each other.
+_target_: stable_worldmodel.planning.WeightedSum
+terms:
+  - - 1.0
+    - _target_: stable_worldmodel.planning.GoalMSE
+      pred_key: predicted_proprio_emb
+      goal_key: proprio_goal_emb
+      reduction: mean
+  - - 1.0
+    - _target_: stable_worldmodel.planning.GoalMSE
+      pred_key: predicted_pixels_emb
+      goal_key: pixels_goal_emb
+      reduction: mean

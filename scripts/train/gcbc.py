@@ -1,26 +1,28 @@
+import logging
 import os
-from collections import OrderedDict
 
 import hydra
 import lightning as pl
 import stable_pretraining as spt
-import stable_worldmodel as swm
 import torch
-from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
-from loguru import logger as logging
-from omegaconf import OmegaConf
+from lightning.pytorch.callbacks import Callback
+from stable_worldmodel.data import column_normalizer as get_column_normalizer
+from stable_worldmodel.wm.utils import save_pretrained
+from lightning.pytorch.loggers import WandbLogger
+from omegaconf import OmegaConf, open_dict
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
-from transformers import AutoModel
 
-from stable_worldmodel.data import column_normalizer as get_column_normalizer
-
-from utils import SaveCkptCallback, build_wandb_logger, setup_run_dir
+import stable_worldmodel as swm
 
 
 # ============================================================================
 # Data Setup
 # ============================================================================
+
+logger = logging.getLogger(__name__)
+
+
 def get_data(cfg):
     """Setup dataset with image transforms and normalization."""
 
@@ -35,50 +37,41 @@ def get_data(cfg):
         )
 
     cache_dir = os.environ.get('LOCAL_DATASET_DIR', None)
-    logging.info(
-        f'Loading dataset "{cfg.dataset_name}" from '
-        f'{"local cache: " + cache_dir if cache_dir else "default location"}'
-    )
 
-    use_proprio = cfg.dinowm.get('use_proprio_encoder', True)
-    keys_to_load = ['pixels', 'action']
-    keys_to_cache = ['action']
-    if use_proprio:
-        keys_to_load.append('proprio')
-        keys_to_cache.append('proprio')
+    # Dataset params come from the shared data node (config/data/pusht.yaml),
+    # like scripts/train/lewm.py.
+    dataset_cfg = OmegaConf.to_container(cfg.data.dataset, resolve=True)
+    dataset_name = dataset_cfg.pop('name')
+    print(
+        f'Loading dataset "{dataset_name}" from {"local cache: " + cache_dir if cache_dir else "default location"}'
+    )
 
     dataset = swm.data.load_dataset(
-        cfg.dataset_name,
-        num_steps=cfg.n_steps,
-        frameskip=cfg.frameskip,
+        dataset_name,
         transform=None,
         cache_dir=cache_dir,
-        keys_to_load=keys_to_load,
-        keys_to_cache=keys_to_cache,
+        **dataset_cfg,
     )
 
-    norm_action_transform = get_column_normalizer(dataset, 'action', 'action')
-    transforms = [
-        get_img_pipeline('pixels', 'pixels', cfg.image_size),
-        norm_action_transform,
-    ]
+    # Normalize every non-pixel column (as in scripts/train/lewm.py) and mirror
+    # pixels/proprio into goal observations for the goal-conditioned policy.
+    keys_to_load = list(cfg.data.dataset.keys_to_load)
+    transforms = [get_img_pipeline('pixels', 'pixels', cfg.image_size)]
+    for col in keys_to_load:
+        if col == 'pixels':
+            continue
+        transforms.append(get_column_normalizer(dataset, col, col))
+
     goal_keys = {'pixels': 'goal_pixels'}
-    if use_proprio:
-        norm_proprio_transform = get_column_normalizer(
-            dataset, 'proprio', 'proprio'
-        )
-        transforms.append(norm_proprio_transform)
+    if 'proprio' in keys_to_load:
         goal_keys['proprio'] = 'goal_proprio'
 
-    # Apply transforms to all steps and goal observations
-    transform = spt.data.transforms.Compose(*transforms)
-
-    dataset.transform = transform
+    dataset.transform = spt.data.transforms.Compose(*transforms)
 
     dataset = swm.data.GoalDataset(
         dataset=dataset,
         goal_probabilities=(0.0, 0.0, 1.0, 0.0),
-        current_goal_offset=cfg.dinowm.history_size,
+        current_goal_offset=cfg.wm.history_size,
         goal_keys=goal_keys,
         seed=cfg.seed,
     )
@@ -97,11 +90,11 @@ def get_data(cfg):
             lengths=[train_subset_fraction, 1 - train_subset_fraction],
             generator=rnd_gen,
         )
-        logging.info(
+        logger.info(
             f'Using {train_subset_fraction:.1%} of training data: {len(train_set)} samples'
         )
 
-    logging.info(f'Train: {len(train_set)}, Val: {len(val_set)}')
+    logger.info(f'Train: {len(train_set)}, Val: {len(val_set)}')
 
     train = DataLoader(
         train_set,
@@ -157,20 +150,20 @@ def get_gcbc_policy(cfg):
 
         # Use history to predict next actions
         embedding = batch['embed'][
-            :, : cfg.dinowm.history_size, :, :
+            :, : cfg.wm.history_size, :, :
         ]  # (B, T-1, patches, dim)
         goal_embedding = batch['goal_embed']  # (B, 1, patches, dim)
         action_pred, _ = self.model.predict_actions(
             embedding, goal_embedding
         )  # (B, num_preds, action_dim)
         action_target = batch['action'][
-            :, : cfg.dinowm.history_size, :
+            :, : cfg.wm.history_size, :
         ]  # (B, num_preds, action_dim)
 
         # Compute action MSE
         action_loss = F.mse_loss(action_pred, action_target)
         if torch.isnan(action_loss):
-            logging.error(
+            logger.error(
                 f'NaN loss! action_pred has nan: {torch.isnan(action_pred).any()}, action_target has nan: {torch.isnan(action_target).any()}'
             )
         batch['loss'] = action_loss
@@ -189,78 +182,53 @@ def get_gcbc_policy(cfg):
 
         return batch
 
-    # Load encoder based on config
-    encoder_type = cfg.get('encoder_type', 'dino')
-    if encoder_type == 'dino':
-        # Load frozen DINO encoder
-        encoder = AutoModel.from_pretrained('facebook/dinov2-small')
-        embedding_dim = encoder.config.hidden_size
-        encoder_trainable = False
-        logging.info('Using pretrained frozen DINO encoder')
-    elif encoder_type == 'vit_tiny':
-        # Load trainable ViT tiny from scratch
-        encoder = spt.backbone.utils.vit_hf(
-            'tiny',
-            patch_size=cfg.patch_size,
-            image_size=cfg.image_size,
-            pretrained=False,
-            use_mask_token=False,
-        )
-        embedding_dim = encoder.config.hidden_size
-        encoder_trainable = True
-        logging.info('Using trainable ViT tiny encoder (from scratch)')
-    else:
-        raise ValueError(f'Unknown encoder_type: {encoder_type}')
+    # Instantiate the frozen pretrained encoder from the model config, then
+    # freeze it (mirrors scripts/train/prejepa.py — no EvalOnly wrapper needed).
+    encoder = hydra.utils.instantiate(cfg.model.encoder)
+    encoder.eval()
+    encoder.requires_grad_(False)
 
-    # Calculate actual number of patches based on the actual image size used by DINO
+    # Fill the runtime-dependent predictor dims left as ??? in the config.
     assert cfg.image_size % cfg.patch_size == 0, (
         'Image size must be multiple of patch size'
     )
     num_patches = (cfg.image_size // cfg.patch_size) ** 2
-    if cfg.dinowm.get('use_proprio_encoder', True):
-        embedding_dim += cfg.dinowm.proprio_embed_dim  # Total embedding size
+    embedding_dim = encoder.config.hidden_size
+    # NOTE: 'frameskip' > 1 is used to predict action chunks.
+    effective_act_dim = cfg.data.dataset.frameskip * cfg.wm.action_dim
 
-    logging.info(f'Patches: {num_patches}, Embedding dim: {embedding_dim}')
+    use_proprio = cfg.wm.get('use_proprio_encoder', True)
+    if use_proprio:
+        embedding_dim += cfg.wm.proprio_embed_dim  # concatenated to patches
 
-    # Build causal predictor (transformer that predicts next actions)
-    effective_act_dim = (
-        cfg.frameskip * cfg.dinowm.action_dim
-    )  # NOTE: 'frameskip' > 1 is used to predict action chunks
-    predictor = swm.wm.gcrl.Predictor(
-        num_patches=num_patches,
-        num_frames=cfg.dinowm.history_size,
-        dim=embedding_dim,
-        out_dim=effective_act_dim,
-        **cfg.predictor,
+    logger.info(
+        f'Patches: {num_patches}, Embedding dim: {embedding_dim}, '
+        f'Action dim: {effective_act_dim}, Proprio encoder: {use_proprio}'
     )
 
-    # Build proprioception encoder (optional)
-    extra_encoders = None
-    if cfg.dinowm.get('use_proprio_encoder', True):
-        extra_encoders = OrderedDict()
-        extra_encoders['proprio'] = swm.wm.gcrl.Embedder(
-            in_chans=cfg.dinowm.proprio_dim,
-            emb_dim=cfg.dinowm.proprio_embed_dim,
-        )
-        extra_encoders = torch.nn.ModuleDict(extra_encoders)
+    with open_dict(cfg):
+        cfg.model.action_predictor.num_patches = num_patches
+        cfg.model.action_predictor.dim = embedding_dim
+        cfg.model.action_predictor.out_dim = effective_act_dim
+        # Optional proprioception encoder, built into the (saved) model config as
+        # a ModuleDict so load_pretrained can rebuild it (mirrors prejepa.py).
+        if use_proprio:
+            cfg.model.extra_encoders = {
+                '_target_': 'torch.nn.ModuleDict',
+                'modules': {
+                    'proprio': {
+                        '_target_': 'stable_worldmodel.wm.gcrl.module.Embedder',
+                        'in_chans': cfg.wm.proprio_dim,
+                        'emb_dim': cfg.wm.proprio_embed_dim,
+                    }
+                },
+            }
 
-    logging.info(
-        f'Action dim: {effective_act_dim}, Proprio encoder: {extra_encoders is not None}'
-    )
+    # Build the policy from the (now fully-specified) model config, passing the
+    # pre-built frozen encoder. The cfg.model.encoder node is kept in the saved
+    # config so load_pretrained can rebuild the encoder from scratch.
+    gcbc_policy = hydra.utils.instantiate(cfg.model, encoder=encoder)
 
-    # Assemble policy
-    # Wrap encoder in EvalOnly if frozen (DINO), otherwise keep trainable (ViT tiny)
-    wrapped_encoder = (
-        spt.backbone.EvalOnly(encoder) if not encoder_trainable else encoder
-    )
-    gcbc_policy = swm.wm.gcrl.GCRL(
-        encoder=wrapped_encoder,
-        action_predictor=predictor,
-        extra_encoders=extra_encoders,
-        history_size=cfg.dinowm.history_size,
-    )
-
-    # Wrap in stable_spt Module with separate optimizers for each component
     def add_opt(module_name, lr):
         return {
             'modules': str(module_name),
@@ -268,22 +236,15 @@ def get_gcbc_policy(cfg):
             'scheduler': {'type': 'LinearWarmupCosineAnnealingLR'},
         }
 
+    # Encoder is frozen; train the action predictor (+ proprio encoder if used).
     optim_config = {
         'action_predictor_opt': add_opt(
             'model.action_predictor', cfg.predictor_lr
         ),
     }
-
-    # Add proprio encoder optimizer if enabled
-    if extra_encoders is not None:
+    if use_proprio:
         optim_config['proprio_opt'] = add_opt(
             'model.extra_encoders.proprio', cfg.proprio_encoder_lr
-        )
-
-    # Add encoder optimizer if trainable (ViT tiny)
-    if encoder_trainable:
-        optim_config['encoder_opt'] = add_opt(
-            'model.encoder', cfg.get('encoder_lr', 1e-4)
         )
 
     gcbc_policy = spt.Module(
@@ -295,49 +256,96 @@ def get_gcbc_policy(cfg):
 
 
 # ============================================================================
+# Training Setup
+# ============================================================================
+def setup_pl_logger(cfg):
+    if not cfg.wandb.enable:
+        return None
+
+    wandb_run_id = cfg.wandb.get('run_id', None)
+    wandb_logger = WandbLogger(
+        name='dino_gcbc',
+        project=cfg.wandb.project,
+        entity=cfg.wandb.entity,
+        resume='allow' if wandb_run_id else None,
+        id=wandb_run_id,
+        log_model=False,
+    )
+
+    wandb_logger.log_hyperparams(OmegaConf.to_container(cfg))
+    return wandb_logger
+
+
+class SaveCkptCallback(Callback):
+    """Callback to save model checkpoint after each epoch using save_pretrained."""
+
+    def __init__(self, run_name, cfg, epoch_interval: int = 1):
+        super().__init__()
+        self.run_name = run_name
+        self.cfg = cfg
+        self.epoch_interval = epoch_interval
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        super().on_train_epoch_end(trainer, pl_module)
+
+        if trainer.is_global_zero:
+            if (trainer.current_epoch + 1) % self.epoch_interval == 0:
+                self._save(pl_module.model, trainer.current_epoch + 1)
+
+            # save final epoch
+            if (trainer.current_epoch + 1) == trainer.max_epochs:
+                self._save(pl_module.model, trainer.current_epoch + 1)
+
+    def _save(self, model, epoch):
+        save_pretrained(
+            model,
+            run_name=self.run_name,
+            config=self.cfg,
+            filename=f'weights_epoch_{epoch}.pt',
+        )
+
+
+# ============================================================================
 # Main Entry Point
 # ============================================================================
 @hydra.main(version_base=None, config_path='./config', config_name='gcbc')
 def run(cfg):
-    pl_logger = build_wandb_logger(cfg)
+    """Run training of predictor"""
+
+    wandb_logger = setup_pl_logger(cfg)
     data = get_data(cfg)
     gcbc_policy = get_gcbc_policy(cfg)
 
-    run_dir = setup_run_dir(cfg)
-    last_ckpt = run_dir / 'lightning' / 'last.ckpt'
-
-    callbacks = [
-        ModelCheckpoint(
-            dirpath=run_dir / 'lightning',
-            filename='epoch={epoch:04d}',
-            monitor='val/loss',
-            save_top_k=cfg.checkpointing.save_top_k,
-            save_last=cfg.checkpointing.save_last,
-            mode='min',
-            verbose=True,
-        ),
-        LearningRateMonitor(logging_interval='step'),
-        SaveCkptCallback(
-            run_name=cfg.output_model_name,
-            cfg=cfg,
-            every_n_epochs=cfg.checkpointing.every_n_epochs,
-        ),
-    ]
+    cache_dir = swm.data.utils.get_cache_dir(sub_folder='checkpoints')
+    # Save `cfg.model` (the instantiable GCRL sub-config), not the full training
+    # cfg — `load_pretrained` does `instantiate(config).load_state_dict(...)`, so
+    # config.json must be the model config itself.
+    save_ckpt_callback = SaveCkptCallback(
+        run_name=cfg.output_model_name,
+        cfg=cfg.model,
+        epoch_interval=3,
+    )
 
     trainer = pl.Trainer(
         **cfg.trainer,
-        callbacks=callbacks,
+        callbacks=[save_ckpt_callback],
         num_sanity_val_steps=1,
-        logger=pl_logger,
+        logger=wandb_logger,
+        enable_checkpointing=True,
     )
 
-    spt.Manager(
+    manager = spt.Manager(
         trainer=trainer,
         module=gcbc_policy,
         data=data,
-        ckpt_path=last_ckpt if last_ckpt.exists() else None,
-    )()
+        ckpt_path=f'{cache_dir}/{cfg.output_model_name}_weights.ckpt',
+    )
+    manager()
 
 
 if __name__ == '__main__':
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(levelname)s | %(name)s | %(message)s',
+    )
     run()

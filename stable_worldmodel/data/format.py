@@ -28,6 +28,32 @@ WRITE_MODES = ('append', 'overwrite', 'error')
 - ``error``: raise :class:`FileExistsError` if the dataset already exists.
 """
 
+EPISODE_DATA_KEY = '_episode_data'
+"""Reserved episode-dict key carrying episode-scoped data.
+
+Episode-scoped values are constant within an episode but vary across
+episodes (e.g. a scene XML, per-episode metadata, a full simulator state
+whose dimension differs per scene). They ride inside the episode dict as a
+plain ``{name: value}`` mapping under this key, next to the per-step
+columns; writers that support them (``Format.supports_episode_data``)
+split them out with :func:`split_episode_data` and store one value per
+episode. The leading underscore keeps the key out of the per-step column
+namespace — ``World.collect`` never emits ``_``-prefixed columns.
+"""
+
+
+def split_episode_data(ep_data: dict) -> tuple[dict, dict]:
+    """Split an episode dict into ``(per_step_cols, episode_data)``.
+
+    Non-mutating: when :data:`EPISODE_DATA_KEY` is present, returns a
+    shallow copy of ``ep_data`` without it plus a copy of the episode-data
+    mapping; otherwise returns ``ep_data`` itself and an empty dict.
+    """
+    if EPISODE_DATA_KEY not in ep_data:
+        return ep_data, {}
+    per_step = {k: v for k, v in ep_data.items() if k != EPISODE_DATA_KEY}
+    return per_step, dict(ep_data[EPISODE_DATA_KEY] or {})
+
 
 def validate_write_mode(mode: str) -> str:
     if mode not in WRITE_MODES:
@@ -53,13 +79,30 @@ def list_formats() -> list[str]:
     return list(FORMATS)
 
 
+# Formats that only register when their optional extra is installed. Used to
+# turn "unknown format 'lance'" — the error a base install hits first, since
+# lance is the default format — into an actionable message.
+_OPTIONAL_FORMAT_EXTRAS = {
+    'lance': 'data',
+    'lance_video': 'format',
+    'hdf5': 'format',
+    'video': 'format',
+    'lerobot': 'lerobot',
+}
+
+
 def get_format(name: str) -> type[Format]:
     try:
         return FORMATS[name]
     except KeyError:
-        raise ValueError(
-            f'unknown format {name!r}; available: {list_formats()}'
-        ) from None
+        msg = f'unknown format {name!r}; available: {list_formats()}'
+        extra = _OPTIONAL_FORMAT_EXTRAS.get(name)
+        if extra is not None:
+            msg += (
+                f'. The {name!r} format needs its optional dependencies: '
+                f'pip install "stable-worldmodel[{extra}]"'
+            )
+        raise ValueError(msg) from None
 
 
 def detect_format(path) -> type[Format] | None:
@@ -78,6 +121,13 @@ class Format:
     """
 
     name: str = ''
+
+    #: Whether this format's writer persists episode-scoped data (the
+    #: :data:`EPISODE_DATA_KEY` entry of an episode dict). Routing code
+    #: (``convert``/``merge``/``ReplayBuffer.dump``) strips episode data
+    #: with a warning before handing episodes to writers of formats that
+    #: leave this ``False``.
+    supports_episode_data: bool = False
 
     @classmethod
     def detect(cls, path) -> bool:
@@ -115,6 +165,12 @@ class Writer(Protocol):
       ``table.add`` produces a new dataset version) override this with a
       streaming implementation; everyone else can fall back to looping over
       :meth:`write_episode`.
+
+    Episode dicts may carry episode-scoped data under
+    :data:`EPISODE_DATA_KEY`. Writers of formats declaring
+    ``supports_episode_data = True`` split it out internally with
+    :func:`split_episode_data` and persist one value per episode; other
+    writers must never receive the key (routing code strips it first).
     """
 
     def __enter__(self) -> Writer: ...
@@ -124,6 +180,7 @@ class Writer(Protocol):
 
 
 __all__ = [
+    'EPISODE_DATA_KEY',
     'FORMATS',
     'Format',
     'Writer',
@@ -131,4 +188,5 @@ __all__ = [
     'get_format',
     'list_formats',
     'register_format',
+    'split_episode_data',
 ]

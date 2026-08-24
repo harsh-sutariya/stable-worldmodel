@@ -5,6 +5,14 @@ Image columns (``pixels`` or ``pixels_<view>``) are stored as JPEG blobs in
 float32. Two index columns — ``episode_idx`` and ``step_idx`` — let the reader
 recover episode boundaries by scanning a single column.
 
+Episode-scoped data (the :data:`~stable_worldmodel.data.EPISODE_DATA_KEY`
+entry of an episode dict — values constant within an episode, e.g. a scene
+XML) is stored in a ``<table>_episodes`` side table with one row per
+episode: ``episode_idx`` plus one column per key (str → ``pa.string``,
+bytes → ``pa.large_binary``, scalars → their arrow type, numeric arrays →
+variable-length ``pa.list_(float32)``). Per-step string columns are not
+supported: every binary frames column is an encoded image.
+
 Lance rejects field names containing ``.`` (it uses dot as a struct-field
 path separator). The writer transparently renames ``foo.bar`` → ``foo_bar``;
 readers refer to columns by their on-disk (renamed) name.
@@ -33,6 +41,7 @@ from stable_worldmodel.data.dataset import Dataset
 from stable_worldmodel.data.format import (
     Format,
     register_format,
+    split_episode_data,
     validate_write_mode,
 )
 from stable_worldmodel.data.formats.utils import is_image_column
@@ -87,7 +96,143 @@ def _encode_frame(frame: np.ndarray, jpeg_quality: int) -> bytes:
     return buf.getvalue()
 
 
+def _settle_episode_keys(
+    settled: tuple[str, ...] | None,
+    ep_extra: dict,
+    *,
+    appending: bool,
+    writer_name: str,
+    table_name: str,
+    episodes_table_name: str,
+) -> tuple[str, ...]:
+    """Enforce a fixed episode-data key set per table; return it settled.
+
+    The first episode of a fresh table fixes the key set (possibly empty);
+    every later episode — including across append sessions, where the caller
+    seeds ``settled`` from the on-disk side table — must match it exactly.
+    """
+    keys = tuple(sorted(ep_extra))
+    if settled is None:
+        return keys
+    if keys == settled:
+        return settled
+    if appending and not settled:
+        raise ValueError(
+            f"{writer_name}: table '{table_name}' has no episode-data side "
+            f"table ('{episodes_table_name}') but the incoming episode "
+            f'carries episode data {sorted(keys)}. Regenerate the dataset '
+            'in the episode-data layout before appending.'
+        )
+    raise ValueError(
+        f'{writer_name}: episode-data key mismatch — every episode of '
+        f"table '{table_name}' must carry the same keys. Expected "
+        f'{sorted(settled)}, got {sorted(keys)}.'
+    )
+
+
+def _episode_schema(row: dict) -> pa.Schema:
+    """Infer the ``<table>_episodes`` side-table schema from one row."""
+    fields = [pa.field('episode_idx', pa.int32())]
+    for key in sorted(k for k in row if k != 'episode_idx'):
+        v = row[key]
+        if isinstance(v, str):
+            ptype = pa.string()
+        elif isinstance(v, (bytes, bytearray, memoryview)):
+            ptype = pa.large_binary()
+        elif isinstance(v, (bool, np.bool_)):
+            ptype = pa.bool_()
+        elif isinstance(v, (int, np.integer)):
+            ptype = pa.int64()
+        elif isinstance(v, (float, np.floating)):
+            ptype = pa.float64()
+        elif isinstance(v, (np.ndarray, torch.Tensor, list, tuple)):
+            ptype = pa.list_(pa.float32())
+        else:
+            raise TypeError(
+                'unsupported episode-data type '
+                f"{type(v).__name__} for key '{key}' (expected str, "
+                'bytes, scalar, or numeric array).'
+            )
+        fields.append(pa.field(key, ptype))
+    return pa.schema(fields)
+
+
+def _episode_value_array(field: pa.Field, vals: list) -> pa.Array:
+    if pa.types.is_string(field.type):
+        vals = [
+            v.decode() if isinstance(v, (bytes, bytearray)) else str(v)
+            for v in vals
+        ]
+    elif pa.types.is_large_binary(field.type):
+        vals = [v.encode() if isinstance(v, str) else bytes(v) for v in vals]
+    elif pa.types.is_list(field.type):
+        vals = [
+            np.asarray(
+                v.detach().cpu() if isinstance(v, torch.Tensor) else v,
+                dtype=np.float32,
+            ).reshape(-1)
+            for v in vals
+        ]
+    return pa.array(vals, type=field.type)
+
+
+def _episode_rows_table(
+    rows: list[dict], schema: pa.Schema | None
+) -> tuple[pa.Table, pa.Schema]:
+    """Build the side-table batch for ``rows``, inferring the schema from
+    the first row when none is settled yet."""
+    if schema is None:
+        schema = _episode_schema(rows[0])
+    arrays = [
+        _episode_value_array(field, [row[field.name] for row in rows])
+        for field in schema
+    ]
+    return pa.Table.from_batches(
+        [pa.record_batch(arrays, schema=schema)]
+    ), schema
+
+
 _MP_START_FORCED = False
+
+# Imported once by the forkserver so DataLoader workers fork from a warm
+# interpreter instead of re-importing this stack per worker (~15-30 s each
+# from a network-mounted env; the whole tree is >5 min cold).
+# INVARIANT: nothing on these modules' import path may import lance/lancedb
+# or start runtimes, threads holding locks, or CUDA at import time. In
+# particular the lance Tokio runtime must only ever be created inside each
+# worker, after the fork — that is the whole reason forkserver is used. Do
+# NOT add `lancedb`, `stable_worldmodel.data`, `stable_pretraining.data`, or
+# anything else that imports lance at module level.
+# Every module here must also import cleanly or raise *ImportError* when
+# absent: the stdlib forkserver swallows only ImportError from preload
+# modules, so any other exception at import time kills the server and makes
+# every worker start fail with BrokenPipeError. Modules that load native
+# libraries (and can raise RuntimeError/OSError) go in
+# _FORKSERVER_PRELOAD_OPTIONAL instead, which is probed before use.
+_FORKSERVER_PRELOAD = (
+    'numpy',
+    'PIL',
+    'pyarrow',
+    'torch',
+    'torchvision',
+    'lightning',
+    'transformers',
+    'datasets',
+    'cv2',
+    'stable_pretraining',
+    'stable_worldmodel',
+)
+
+# Media decoders/encoders used by the lance-video path. They dlopen FFmpeg
+# shared libraries at import and raise RuntimeError/OSError (not ImportError)
+# when those are missing or ABI-incompatible — exactly what the forkserver
+# will not tolerate. We import them in the parent first and preload only the
+# ones that actually load, so a broken/absent FFmpeg degrades to "not
+# preloaded" instead of crashing every DataLoader worker.
+_FORKSERVER_PRELOAD_OPTIONAL = (
+    'imageio',
+    'torchcodec',
+)
 
 
 def _force_forkserver() -> None:
@@ -101,7 +246,16 @@ def _force_forkserver() -> None:
     lancedb itself recommends. Worker startup is also cheaper than ``spawn``
     (a fork of the clean server vs a full re-exec + re-import per worker).
     Falls back to ``spawn`` where forkserver is unavailable.
+
+    The server preloads :data:`_FORKSERVER_PRELOAD` (heavy, fork-benign
+    modules only — never lance itself) so each worker forks with the
+    expensive imports already in ``sys.modules``. Modules absent from the
+    environment raise ImportError and are silently skipped by the stdlib
+    forkserver; :data:`_FORKSERVER_PRELOAD_OPTIONAL` modules (which can fail
+    with RuntimeError/OSError) are probed here and only preloaded when they
+    load, since a non-ImportError in the server would kill every worker.
     """
+    import importlib
     import logging
     import multiprocessing as mp
     import sys
@@ -121,6 +275,21 @@ def _force_forkserver() -> None:
             mp.set_start_method(target, force=True)
         except RuntimeError as exc:
             logging.warning('Could not switch to %s (%s)', target, exc)
+    if mp.get_start_method(allow_none=True) == 'forkserver':
+        preload = list(_FORKSERVER_PRELOAD)
+        for modname in _FORKSERVER_PRELOAD_OPTIONAL:
+            try:
+                importlib.import_module(modname)
+            except Exception as exc:
+                logging.warning(
+                    'Skipping forkserver preload of %s (%s)', modname, exc
+                )
+            else:
+                preload.append(modname)
+        try:
+            mp.set_forkserver_preload(preload)
+        except Exception as exc:
+            logging.warning('Could not set forkserver preload (%s)', exc)
     try:
         torch.multiprocessing.set_sharing_strategy('file_system')
     except RuntimeError:
@@ -134,11 +303,17 @@ class LanceDataset(Dataset):
         path: Either a ``.lance`` directory path or a database URI.
         table_name: Table inside the database; inferred from a ``.lance``
             path when omitted.
-        frameskip, num_steps, transform, keys_to_load, keys_to_cache,
-            keys_to_merge: standard ``Dataset`` knobs.
-        image_columns: override image-column auto-detection (any
-            ``pa.binary`` column is treated as encoded image by default).
-        episode_index_column, step_index_column: index column names.
+        uri: Alternative to ``path`` for passing a database URI directly.
+        frameskip: Standard ``Dataset`` knob.
+        num_steps: Standard ``Dataset`` knob.
+        transform: Standard ``Dataset`` knob.
+        keys_to_load: Standard ``Dataset`` knob.
+        keys_to_cache: Standard ``Dataset`` knob.
+        keys_to_merge: Standard ``Dataset`` knob.
+        image_columns: override image-column auto-detection (every
+            ``pa.binary`` column is treated as an encoded image by default).
+        episode_index_column: episode index column name.
+        step_index_column: step index column name.
         connect_kwargs: forwarded to :func:`lancedb.connect` (e.g. S3 creds).
     """
 
@@ -169,6 +344,7 @@ class LanceDataset(Dataset):
         )
         self.uri = resolved_uri
         self.table_name = resolved_name
+        self._episodes_table_name = f'{resolved_name}_episodes'
         self.connect_kwargs = connect_kwargs or {}
         self._index_columns = (episode_index_column, step_index_column)
         self._cache: dict[str, np.ndarray] = {}
@@ -176,7 +352,35 @@ class LanceDataset(Dataset):
         self._fetch_columns: list[str] | None = None
 
         _force_forkserver()
-        table = self._connect_table()
+        db = lancedb.connect(self.uri, **self.connect_kwargs)
+        table = db.open_table(self.table_name)
+
+        legacy_strings = [
+            f.name
+            for f in table.schema
+            if f.name not in self._index_columns
+            and (
+                pa.types.is_string(f.type) or pa.types.is_large_string(f.type)
+            )
+        ]
+        if legacy_strings:
+            raise ValueError(
+                f"Lance table '{self.table_name}' at '{self.uri}' contains "
+                f'per-step string columns {legacy_strings} (legacy layout). '
+                'Per-step strings are no longer supported: episode-scoped '
+                f"values now live in a '{self._episodes_table_name}' side "
+                'table. Regenerate the dataset in the episode-data layout.'
+            )
+
+        self._episode_columns: list[str] = []
+        self._episode_data_cache: dict[str, list] | None = None
+        self._episode_row_order_cache: np.ndarray | None = None
+        if self._episodes_table_name in db.list_tables().tables:
+            ep_schema = db.open_table(self._episodes_table_name).schema
+            self._episode_columns = [
+                n for n in ep_schema.names if n != 'episode_idx'
+            ]
+
         self._schema_names = list(table.schema.names)
         available = [
             c for c in self._schema_names if c not in self._index_columns
@@ -229,9 +433,121 @@ class LanceDataset(Dataset):
     def column_names(self) -> list[str]:
         return list(self._keys)
 
+    @property
+    def episode_column_names(self) -> list[str]:
+        return list(self._episode_columns)
+
+    #: Episode-data columns of these types hold arbitrary user payloads
+    #: (scene files, serialized states, arrays). They are fetched per
+    #: request instead of cached whole, so worker RSS stays bounded by the
+    #: episodes actually touched — not by ``n_episodes x payload size``.
+    @staticmethod
+    def _is_heavy_episode_type(ptype) -> bool:
+        return (
+            pa.types.is_binary(ptype)
+            or pa.types.is_large_binary(ptype)
+            or pa.types.is_list(ptype)
+            or pa.types.is_large_list(ptype)
+            or pa.types.is_fixed_size_list(ptype)
+        )
+
+    def get_episode_data(
+        self, episodes_idx: np.ndarray | list[int] | None = None
+    ) -> dict[str, list]:
+        if not self._episode_columns:
+            return {}
+        order = self._episode_row_order()
+        if episodes_idx is None:
+            idxs = np.arange(len(self.lengths), dtype=np.int64)
+        else:
+            idxs = np.asarray(episodes_idx, dtype=np.int64).reshape(-1)
+
+        ds = (
+            lancedb.connect(self.uri, **self.connect_kwargs)
+            .open_table(self._episodes_table_name)
+            .to_lance()
+        )
+        schema = ds.schema
+        light = [
+            c
+            for c in self._episode_columns
+            if not self._is_heavy_episode_type(schema.field(c).type)
+        ]
+        heavy = [c for c in self._episode_columns if c not in light]
+
+        out: dict[str, list] = {}
+        if light:
+            # Cheap scalar/string columns: load once, cache in episode
+            # order (a few bytes per episode).
+            if self._episode_data_cache is None:
+                tbl = ds.to_table(columns=['episode_idx', *light])
+                cache: dict[str, list] = {}
+                for name in light:
+                    col = tbl.column(name)
+                    raw = col.to_pylist()
+                    cache[name] = [
+                        self._decode_episode_value(raw[int(i)], col.type)
+                        for i in order
+                    ]
+                self._episode_data_cache = cache
+            out.update(
+                {
+                    k: [vals[int(i)] for i in idxs]
+                    for k, vals in self._episode_data_cache.items()
+                }
+            )
+        if heavy:
+            # Payload columns: fetch exactly the requested episodes' rows.
+            rows = order[idxs]
+            tbl = ds.take(rows.tolist(), columns=heavy)
+            for name in heavy:
+                col = tbl.column(name)
+                raw = col.to_pylist()
+                out[name] = [
+                    self._decode_episode_value(v, col.type) for v in raw
+                ]
+        return out
+
+    def _episode_row_order(self) -> np.ndarray:
+        """Physical side-table row per ordinal episode (validated once)."""
+        if self._episode_row_order_cache is None:
+            db = lancedb.connect(self.uri, **self.connect_kwargs)
+            ds = db.open_table(self._episodes_table_name).to_lance()
+            ep_ids = (
+                ds.to_table(columns=['episode_idx'])
+                .column('episode_idx')
+                .to_numpy(zero_copy_only=False)
+            )
+            n = len(self.lengths)
+            if len(ep_ids) != n or not np.array_equal(
+                np.sort(ep_ids), np.arange(n)
+            ):
+                raise ValueError(
+                    f"Lance episode-data table '{self._episodes_table_name}'"
+                    f" at '{self.uri}' has {len(ep_ids)} rows for {n} "
+                    'episodes — the dataset is inconsistent (partial '
+                    'write?). Rebuild it.'
+                )
+            self._episode_row_order_cache = np.argsort(ep_ids)
+        return self._episode_row_order_cache
+
+    @staticmethod
+    def _decode_episode_value(value, ptype) -> Any:
+        if value is None:
+            return None
+        if pa.types.is_list(ptype) or pa.types.is_fixed_size_list(ptype):
+            return np.asarray(value, dtype=np.float32)
+        if pa.types.is_binary(ptype) or pa.types.is_large_binary(ptype):
+            return bytes(value)
+        return value
+
     def __getstate__(self) -> dict:
         state = self.__dict__.copy()
         state['_perm'] = None
+        # Episode blobs (e.g. scene XMLs) can be large; workers reload the
+        # tiny side table lazily instead of shipping the cache in the pickle.
+        state['_episode_data_cache'] = None
+        state['_episode_row_order_cache'] = None
         # spt.Module sets `dataset._trainer = trainer` on every dataset to
         # inject `global_step` / `current_epoch` into samples. The trainer
         # transitively reaches `train_dataloader._iterator` (a
@@ -263,10 +579,15 @@ class LanceDataset(Dataset):
             )
             return parent, leaf[: -len('.lance')]
 
-        # Directory holding a single *.lance subdir.
+        # Directory holding a single *.lance subdir. `_episodes` /
+        # `_videos` siblings are companion tables, never the frames table.
         p = Path(loc)
         if p.is_dir():
-            tables = sorted(p.glob('*.lance'))
+            tables = sorted(
+                t
+                for t in p.glob('*.lance')
+                if not t.stem.endswith(('_episodes', '_videos'))
+            )
             if len(tables) == 1:
                 return str(p), tables[0].stem
             if len(tables) > 1:
@@ -435,49 +756,50 @@ class LanceDataset(Dataset):
         return tensor
 
     def _process_batch(
-        self, ep_idx: int, g_start: int, batch, g_end: int | None = None
+        self,
+        ep_idx: int,
+        g_start: int,
+        batch,
+        g_end: int | None = None,
+        decoded_images: dict | None = None,
     ) -> dict:
         if g_end is None:
             g_end = g_start + self.span
-        steps: dict[str, Any] = {}
+        decoded_images = decoded_images or {}
+        steps = {}
         for col in self._keys:
-            if col in self._cache:
-                values = self._cache[col][g_start:g_end]
-            elif batch is None:
-                raise KeyError(
-                    f"Column '{col}' not cached and no batch provided"
-                )
+            if col in decoded_images:
+                steps[col] = decoded_images[col]
             else:
-                values = self._extract_column(batch, col)
-
-            if col in self.image_columns:
-                blobs = values[:: self.frameskip]
-                if isinstance(blobs, np.ndarray):
-                    blobs = blobs.tolist()
-                steps[col] = self._decode_images(blobs)
-                continue
-
-            data = (
-                values
-                if isinstance(values, np.ndarray)
-                else self._pylist_to_numpy(values, col)
-            )
-
-            if data.size > 0 and (
-                data.dtype == object or data.dtype.kind in ('S', 'U')
-            ):
-                first = data.flat[0]
-                if isinstance(first, (bytes, bytearray)):
-                    steps[col] = bytes(first).decode()
-                    continue
-                if isinstance(first, str):
-                    steps[col] = str(first)
-                    continue
-
-            steps[col] = self._prepare_numeric_tensor(
-                data, downsample=col != 'action'
-            )
+                steps[col] = self._process_col(col, batch, g_start, g_end)
         return steps
+
+    def _process_col(self, col: str, batch, g_start: int, g_end: int) -> Any:
+        """Decode a single window column into its tensor / scalar value.
+
+        Split out from :meth:`_process_batch` so subclasses (e.g. the
+        video-blob reader) can intercept select columns while reusing the
+        tabular / JPEG decode path verbatim.
+        """
+        if col in self._cache:
+            values = self._cache[col][g_start:g_end]
+        elif batch is None:
+            raise KeyError(f"Column '{col}' not cached and no batch provided")
+        else:
+            values = self._extract_column(batch, col)
+
+        if col in self.image_columns:
+            blobs = values[:: self.frameskip]
+            if isinstance(blobs, np.ndarray):
+                blobs = blobs.tolist()
+            return self._decode_images(blobs)
+
+        data = (
+            values
+            if isinstance(values, np.ndarray)
+            else self._pylist_to_numpy(values, col)
+        )
+        return self._prepare_numeric_tensor(data, downsample=col != 'action')
 
     def _load_slice(self, ep_idx: int, start: int, end: int) -> dict:
         g_start = int(self.offsets[ep_idx] + start)
@@ -500,18 +822,31 @@ class LanceDataset(Dataset):
             sample_meta.append((ep_idx, g_start))
 
         big_batch = None
+        unique_pos: dict[int, int] | None = None
+        decoded_images: dict[str, torch.Tensor] = {}
         if self._fetch_columns and all_rows:
             self._ensure_open()
             unique_rows = sorted(set(all_rows))
             unique_batch = self._perm.__getitems__(unique_rows)
+            unique_pos = {row: i for i, row in enumerate(unique_rows)}
             if len(unique_rows) == len(all_rows) and all_rows == unique_rows:
                 big_batch = unique_batch
             else:
-                row_lookup = {row: i for i, row in enumerate(unique_rows)}
                 gather = pa.array(
-                    [row_lookup[r] for r in all_rows], type=pa.int64()
+                    [unique_pos[r] for r in all_rows], type=pa.int64()
                 )
                 big_batch = unique_batch.take(gather)
+
+            # Decode each fetched image column once over the deduped rows;
+            # overlapping windows then gather shared frames instead of
+            # re-decoding the same blob per window.
+            for col in self.image_columns:
+                if col in self._cache:
+                    continue
+                blobs = self._extract_column(unique_batch, col)
+                if isinstance(blobs, np.ndarray):
+                    blobs = blobs.tolist()
+                decoded_images[col] = self._decode_images(blobs)
 
         results: list[dict] = []
         for i, (ep_idx, g_start) in enumerate(sample_meta):
@@ -520,7 +855,22 @@ class LanceDataset(Dataset):
                 if big_batch is not None
                 else None
             )
-            steps = self._process_batch(ep_idx, g_start, sub_batch)
+            if decoded_images:
+                window_rows = range(
+                    g_start, g_start + self.span, self.frameskip
+                )
+                gather_idx = [unique_pos[r] for r in window_rows]
+                steps = self._process_batch(
+                    ep_idx,
+                    g_start,
+                    sub_batch,
+                    decoded_images={
+                        col: frames[gather_idx]
+                        for col, frames in decoded_images.items()
+                    },
+                )
+            else:
+                steps = self._process_batch(ep_idx, g_start, sub_batch)
             if self.transform:
                 steps = self.transform(steps)
             if 'action' in steps:
@@ -591,10 +941,15 @@ class LanceWriter:
     the stem is the table name; otherwise ``table_name`` must be supplied.
 
     Image columns (``pixels`` / ``pixels_<view>``, or any uint8 HxWxC array)
-    are JPEG-encoded into ``pa.binary``. String columns become ``pa.string``.
-    Other tabular columns become fixed-size lists of float32. Column names
-    with ``.`` are renamed to ``_`` (Lance rejects dots in top-level field
-    names).
+    are JPEG-encoded into ``pa.binary``. Other tabular columns become
+    fixed-size lists of float32; per-step string columns are dropped with a
+    warning. Column names with ``.`` are renamed to ``_`` (Lance rejects
+    dots in top-level field names).
+
+    Episode-scoped data (the ``EPISODE_DATA_KEY`` entry of an episode dict)
+    goes to a ``<table>_episodes`` side table, one row per episode, flushed
+    after each frames write commits. The key set must be identical for every
+    episode of the table — including across append sessions.
 
     Two write paths:
       * :meth:`write_episode` — push one episode; one ``table.add`` per call,
@@ -642,15 +997,21 @@ class LanceWriter:
         self._appending_existing = False
         self._rename_map: dict[str, str] = {}
         self._image_cols: set[str] = set()
-        self._string_cols: set[str] = set()
         self._dims: dict[str, int] = {}
         self._schema: pa.Schema | None = None
         self._ep_idx = 0
         self._global_ptr = 0
 
+        self._episodes_table_name = f'{self.table_name}_episodes'
+        self._ep_keys: tuple[str, ...] | None = None
+        self._ep_schema: pa.Schema | None = None
+        self._ep_table = None
+        self._pending_ep_rows: list[dict] = []
+
     def __enter__(self):
         self._db = lancedb.connect(self.uri, **self.connect_kwargs)
-        if self.table_name in self._db.list_tables().tables:
+        tables = self._db.list_tables().tables
+        if self.table_name in tables:
             if self.mode == 'error':
                 raise FileExistsError(
                     f"Lance table '{self.table_name}' already exists at "
@@ -659,13 +1020,27 @@ class LanceWriter:
                 )
             if self.mode == 'overwrite':
                 self._db.drop_table(self.table_name)
+                if self._episodes_table_name in tables:
+                    self._db.drop_table(self._episodes_table_name)
             else:
                 self._open_existing_for_append()
+        elif self._episodes_table_name in tables:
+            # Frames table gone but its side table survived (e.g. an
+            # interrupted overwrite): the orphan can only desync the new
+            # session, so drop it.
+            logging.warning(
+                "LanceWriter: dropping orphaned episode-data table '%s' "
+                '(no frames table found).',
+                self._episodes_table_name,
+            )
+            self._db.drop_table(self._episodes_table_name)
         return self
 
     def __exit__(self, *exc):
         self._db = None
         self._table = None
+        self._ep_table = None
+        self._pending_ep_rows.clear()
 
     def write_episode(self, ep_data: dict) -> None:
         if self._db is None:
@@ -691,37 +1066,82 @@ class LanceWriter:
         except StopIteration:
             return
 
+        first_steps, first_extra = split_episode_data(first_ep)
+
+        # Validate eagerly: raised here it stays a clean ValueError instead
+        # of resurfacing wrapped in a RuntimeError once Lance consumes the
+        # batch reader (`_batch_from_episode` re-checks each episode).
+        self._check_episode_keys(first_extra)
+
         if not self._initialized:
-            self._init_schema(first_ep)
+            self._init_schema(first_steps)
             self._initialized = True
         elif self._appending_existing and not self._rename_map:
-            self._validate_episode_against_existing(first_ep)
+            self._validate_episode_against_existing(first_steps)
 
         def batch_gen():
-            yield self._batch_from_episode(first_ep)
+            yield self._batch_from_episode(first_steps, first_extra)
             for ep in iterator:
-                yield self._batch_from_episode(ep)
+                yield self._batch_from_episode(*split_episode_data(ep))
 
         reader = pa.RecordBatchReader.from_batches(self._schema, batch_gen())
-        if self._table is None:
-            self._table = self._db.create_table(
-                self.table_name, data=reader, schema=self._schema
-            )
-        else:
-            self._table.add(reader)
+        try:
+            if self._table is None:
+                self._table = self._db.create_table(
+                    self.table_name, data=reader, schema=self._schema
+                )
+            else:
+                self._table.add(reader)
+        except BaseException:
+            # The frames write did not commit; drop the side-table rows
+            # queued for it so a retry cannot double-write them.
+            self._pending_ep_rows.clear()
+            raise
+        self._flush_episode_rows()
 
-    def _batch_from_episode(self, ep_data: dict) -> pa.RecordBatch:
-        ep_len = len(next(iter(ep_data.values())))
-        batch = self._build_batch(ep_data, ep_len)
+    def _batch_from_episode(
+        self, per_step: dict, ep_extra: dict
+    ) -> pa.RecordBatch:
+        self._check_episode_keys(ep_extra)
+        ep_len = len(next(iter(per_step.values())))
+        batch = self._build_batch(per_step, ep_len)
+        if ep_extra:
+            self._pending_ep_rows.append(
+                {'episode_idx': self._ep_idx, **ep_extra}
+            )
         self._ep_idx += 1
         self._global_ptr += ep_len
         return batch
+
+    def _check_episode_keys(self, ep_extra: dict) -> None:
+        self._ep_keys = _settle_episode_keys(
+            self._ep_keys,
+            ep_extra,
+            appending=self._appending_existing,
+            writer_name='LanceWriter',
+            table_name=self.table_name,
+            episodes_table_name=self._episodes_table_name,
+        )
+
+    def _flush_episode_rows(self) -> None:
+        if not self._pending_ep_rows:
+            return
+        rows, self._pending_ep_rows = self._pending_ep_rows, []
+        tbl, self._ep_schema = _episode_rows_table(rows, self._ep_schema)
+        if self._ep_table is not None:
+            self._ep_table.add(tbl)
+        elif self._episodes_table_name in self._db.list_tables().tables:
+            self._ep_table = self._db.open_table(self._episodes_table_name)
+            self._ep_table.add(tbl)
+        else:
+            self._ep_table = self._db.create_table(
+                self._episodes_table_name, data=tbl, schema=self._ep_schema
+            )
 
     def _open_existing_for_append(self) -> None:
         self._table = self._db.open_table(self.table_name)
         schema = self._table.schema
         image_cols: set[str] = set()
-        string_cols: set[str] = set()
         dims: dict[str, int] = {}
         for f in schema:
             if f.name in ('episode_idx', 'step_idx'):
@@ -731,7 +1151,14 @@ class LanceWriter:
             elif pa.types.is_string(f.type) or pa.types.is_large_string(
                 f.type
             ):
-                string_cols.add(f.name)
+                raise ValueError(
+                    f"LanceWriter: cannot append to '{self.table_name}' — "
+                    f"column '{f.name}' is a per-step string column (legacy "
+                    'layout). Per-step strings are no longer supported: '
+                    'episode-scoped values now live in a '
+                    f"'{self._episodes_table_name}' side table. Regenerate "
+                    'the dataset in the episode-data layout.'
+                )
             elif pa.types.is_fixed_size_list(f.type):
                 dims[f.name] = f.type.list_size
             else:
@@ -741,10 +1168,18 @@ class LanceWriter:
                     f'{f.type}.'
                 )
 
+        if self._episodes_table_name in self._db.list_tables().tables:
+            self._ep_table = self._db.open_table(self._episodes_table_name)
+            self._ep_schema = self._ep_table.schema
+            self._ep_keys = tuple(
+                sorted(n for n in self._ep_schema.names if n != 'episode_idx')
+            )
+        else:
+            self._ep_keys = ()
+
         existing = self._table.to_lance().to_table(columns=['episode_idx'])
         ep_col = existing.column('episode_idx').to_numpy()
         self._image_cols = image_cols
-        self._string_cols = string_cols
         self._dims = dims
         self._schema = schema
         self._global_ptr = int(len(ep_col))
@@ -755,13 +1190,19 @@ class LanceWriter:
     def _validate_episode_against_existing(self, ep_data: dict) -> None:
         reserved = {'episode_idx', 'step_idx'}
         incoming_to_lance: dict[str, str] = {}
+        skipped_strings: list[str] = []
         for col, vals in ep_data.items():
             lance_name = _to_lance_name(col)
             if lance_name in reserved:
                 continue
             is_image = _is_image_name(lance_name) or is_image_column(vals)
-            if not is_image and np.asarray(vals[0]).dtype.kind not in 'biufUS':
-                continue
+            if not is_image:
+                kind = np.asarray(vals[0]).dtype.kind
+                if kind in 'US':
+                    skipped_strings.append(col)
+                    continue
+                if kind not in 'biuf':
+                    continue
             if lance_name in incoming_to_lance.values():
                 raise ValueError(
                     f'LanceWriter: append failed — incoming columns map to '
@@ -770,9 +1211,15 @@ class LanceWriter:
             incoming_to_lance[col] = lance_name
         lance_to_incoming = {v: k for k, v in incoming_to_lance.items()}
 
-        expected = (
-            set(self._image_cols) | set(self._string_cols) | set(self._dims)
-        )
+        if skipped_strings:
+            logging.warning(
+                'LanceWriter: dropping per-step string columns %s — '
+                'per-step strings are not supported; put episode-constant '
+                'values in the episode data instead.',
+                skipped_strings,
+            )
+
+        expected = set(self._image_cols) | set(self._dims)
         incoming = set(lance_to_incoming)
         missing = expected - incoming
         extra = incoming - expected
@@ -814,7 +1261,6 @@ class LanceWriter:
     def _init_schema(self, sample_ep: dict) -> None:
         rename_map: dict[str, str] = {}
         image_cols: set[str] = set()
-        string_cols: set[str] = set()
         dims: dict[str, int] = {}
         ordered_cols: list[str] = []
 
@@ -827,6 +1273,7 @@ class LanceWriter:
                 dropped,
             )
 
+        dropped_strings: list[str] = []
         dropped_non_numeric: list[str] = []
         for col, vals in sample_ep.items():
             lance_name = _to_lance_name(col)
@@ -834,12 +1281,12 @@ class LanceWriter:
                 continue
 
             is_image = _is_image_name(lance_name) or is_image_column(vals)
-            is_string = False
             if not is_image:
                 sample = np.asarray(vals[0])
                 if sample.dtype.kind in 'US':
-                    is_string = True
-                elif sample.dtype.kind not in 'biuf':
+                    dropped_strings.append(col)
+                    continue
+                if sample.dtype.kind not in 'biuf':
                     dropped_non_numeric.append(col)
                     continue
 
@@ -847,11 +1294,16 @@ class LanceWriter:
             ordered_cols.append(lance_name)
             if is_image:
                 image_cols.add(lance_name)
-            elif is_string:
-                string_cols.add(lance_name)
             else:
                 dims[lance_name] = int(sample.reshape(-1).shape[0])
 
+        if dropped_strings:
+            logging.warning(
+                'LanceWriter: dropping per-step string columns %s — '
+                'per-step strings are not supported; put episode-constant '
+                'values in the episode data instead.',
+                dropped_strings,
+            )
         if dropped_non_numeric:
             logging.warning(
                 'LanceWriter: dropping non-numeric columns %s — values are '
@@ -873,14 +1325,11 @@ class LanceWriter:
         for col in ordered_cols:
             if col in image_cols:
                 fields.append(pa.field(col, pa.binary()))
-            elif col in string_cols:
-                fields.append(pa.field(col, pa.string()))
             else:
                 fields.append(pa.field(col, pa.list_(pa.float32(), dims[col])))
 
         self._rename_map = rename_map
         self._image_cols = image_cols
-        self._string_cols = string_cols
         self._dims = dims
         self._schema = pa.schema(fields)
 
@@ -900,12 +1349,6 @@ class LanceWriter:
                     for v in vals
                 ]
                 arrays.append(pa.array(blobs, type=pa.binary()))
-            elif lance_name in self._string_cols:
-                strs = [
-                    v.decode() if isinstance(v, (bytes, bytearray)) else str(v)
-                    for v in vals
-                ]
-                arrays.append(pa.array(strs, type=pa.string()))
             else:
                 dim = self._dims[lance_name]
                 flat = np.asarray(vals, dtype=np.float32).reshape(ep_len, dim)
@@ -921,6 +1364,7 @@ class LanceWriter:
 @register_format
 class Lance(Format):
     name = 'lance'
+    supports_episode_data = True
 
     @classmethod
     def detect(cls, path) -> bool:
@@ -929,6 +1373,10 @@ class Lance(Format):
             return True
         p = Path(s)
         if p.is_dir():
+            # A `*_videos.lance` sibling marks a video-blob dataset; defer to
+            # the `lance_video` format so it claims the directory instead.
+            if any(p.glob('*_videos.lance')):
+                return False
             return any(p.glob('*.lance'))
         return False
 

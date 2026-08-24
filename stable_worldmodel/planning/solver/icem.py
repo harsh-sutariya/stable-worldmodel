@@ -1,5 +1,6 @@
-"""Cross Entropy Method solver for model-based planning."""
+"""Improved Cross Entropy Method (iCEM) solver for model-based planning."""
 
+import logging
 import time
 from typing import Any
 
@@ -7,50 +8,69 @@ import gymnasium as gym
 import numpy as np
 import torch
 from gymnasium.spaces import Box
-from loguru import logger as logging
 
-from stable_worldmodel.solver.utils import prepare_init_action
+from .utils import prepare_init_action
 from .callbacks import Callback
 from .solver import Costable
 
+logger = logging.getLogger(__name__)
 
-class CEMSolver:
-    """Cross Entropy Method solver for action optimization.
+
+class ICEMSolver:
+    """Improved Cross Entropy Method (iCEM) solver with colored noise and elite retention.
+    iCEM improves the sample efficiency over standard CEM and was introduced by
+    [1] for real-time planning.
 
     Args:
-        model: World model implementing the Costable protocol.
+        cost: Cost object to plan against (a Costable, e.g. a ShootingCostEvaluator).
         batch_size: Number of environments to process in parallel.
         num_samples: Number of action candidates to sample per iteration.
         var_scale: Initial variance scale for the action distribution.
         n_steps: Number of CEM iterations.
         topk: Number of elite samples to keep for distribution update.
+        noise_beta: Colored noise exponent. 0 = white (standard CEM), >0 = more low-frequency noise.
+        alpha: Momentum for mean/std EMA update.
+        n_elite_keep: Number of elites carried from previous iteration.
+        return_mean: If False, return best single trajectory instead of mean.
         device: Device for tensor computations.
         seed: Random seed for reproducibility.
+
+    [1] C. Pinneri, S. Sawant, S. Blaes, J. Achterhold, J. Stueckler, M. Rolinek and
+    G, Martius, Georg. "Sample-efficient Cross-Entropy Method for Real-time Planning".
+    Conference on Robot Learning, 2020.
     """
 
     def __init__(
         self,
-        model: Costable,
+        cost: Costable,
         batch_size: int = 1,
         num_samples: int = 300,
         var_scale: float = 1,
         n_steps: int = 30,
         topk: int = 30,
+        noise_beta: float = 2.0,
+        alpha: float = 0.1,
+        n_elite_keep: int = 5,
+        return_mean: bool = True,
         device: str | torch.device = 'cpu',
         seed: int = 1234,
         callbacks: list[Callback] | None = None,
     ) -> None:
-        self.model = model
+        self.cost = cost
         self.batch_size = batch_size
         self.var_scale = var_scale
         self.num_samples = num_samples
         self.n_steps = n_steps
         self.topk = topk
+        self.noise_beta = noise_beta
+        self.alpha = alpha
+        self.n_elite_keep = n_elite_keep
+        self.return_mean = return_mean
         self.device = device
         self.torch_gen = torch.Generator(device=device).manual_seed(seed)
         self.callbacks = list(callbacks) if callbacks else []
         try:
-            self._dtype = next(model.parameters()).dtype
+            self._dtype = next(cost.parameters()).dtype
         except (AttributeError, StopIteration):
             self._dtype = torch.float32
 
@@ -64,10 +84,21 @@ class CEMSolver:
         self._action_dim = int(np.prod(action_space.shape[1:]))
         self._configured = True
 
-        if not isinstance(action_space, Box):
-            logging.warning(
-                f'Action space is discrete, got {type(action_space)}. CEMSolver may not work as expected.'
+        if isinstance(action_space, Box):
+            # candidates have last-dim action_dim * action_block; tile bounds
+            # so clamp broadcasts over the flattened block.
+            self._action_low = torch.tensor(
+                action_space.low[0], device=self.device, dtype=self.dtype
+            ).repeat(self._config.action_block)
+            self._action_high = torch.tensor(
+                action_space.high[0], device=self.device, dtype=self.dtype
+            ).repeat(self._config.action_block)
+        else:
+            logger.warning(
+                f'Action space is discrete, got {type(action_space)}. ICEMSolver may not work as expected.'
             )
+            self._action_low = None
+            self._action_high = None
 
     @property
     def n_envs(self) -> int:
@@ -109,7 +140,9 @@ class CEMSolver:
         if remaining > 0:
             device = mean.device
             new_mean = torch.zeros(
-                [n_envs, remaining, self.action_dim], dtype=self.dtype
+                [n_envs, remaining, self.action_dim],
+                dtype=self.dtype,
+                device=device,
             )
             mean = torch.cat([mean, new_mean], dim=1).to(device)
 
@@ -119,12 +152,12 @@ class CEMSolver:
     def solve(
         self, info_dict: dict, init_action: torch.Tensor | None = None
     ) -> dict:
-        """Solve the planning problem using Cross Entropy Method."""
+        """Solve the planning problem using improved Cross Entropy Method."""
         start_time = time.time()
         outputs = {
             'costs': [],
-            'mean': [],  # History of means
-            'var': [],  # History of vars
+            'mean': [],
+            'var': [],
         }
 
         # Batch size is taken from info_dict so callers can solve for a subset of envs
@@ -132,15 +165,15 @@ class CEMSolver:
 
         # -- warm-start from actor if model is Actionable, else zero-pad
         init_action = prepare_init_action(
-            self.model,
+            self.cost,
             info_dict,
             init_action,
             self.horizon,
             n_envs=total_envs,
             action_dim=self.action_dim,
+            device=self.device,
         )
 
-        # -- initialize the action distribution globally
         mean, var = self.init_action_distrib(total_envs, init_action)
         mean = mean.to(self.device)
         var = var.to(self.device)
@@ -148,16 +181,13 @@ class CEMSolver:
         for cb in self.callbacks:
             cb.reset()
 
-        # --- Iterate over batches ---
         for start_idx in range(0, total_envs, self.batch_size):
             end_idx = min(start_idx + self.batch_size, total_envs)
             current_bs = end_idx - start_idx
 
-            # Slice Distribution Parameters for current batch
             batch_mean = mean[start_idx:end_idx]
             batch_var = var[start_idx:end_idx]
 
-            # Expand Info Dict for current batch
             expanded_infos = {}
             for k, v in info_dict.items():
                 v_batch = v[start_idx:end_idx]
@@ -169,9 +199,7 @@ class CEMSolver:
                         v_batch.to(device=self.device, dtype=target_dtype)
                         .unsqueeze(1)
                         .expand(
-                            current_bs,
-                            self.num_samples,
-                            *v_batch.shape[1:],
+                            current_bs, self.num_samples, *v_batch.shape[1:]
                         )
                     )
                 elif isinstance(v, np.ndarray):
@@ -180,34 +208,77 @@ class CEMSolver:
                     )
                 expanded_infos[k] = v_batch
 
-            # Optimization Loop
-            final_batch_cost = None
+            prev_topk_candidates = None
+            batch_indices = (
+                torch.arange(current_bs, device=self.device)
+                .unsqueeze(1)
+                .expand(-1, self.topk)
+            )
+
+            # Precompute FFT scale for colored noise
+            noise_shape = (
+                current_bs,
+                self.num_samples,
+                self.action_dim,
+                self.horizon,
+            )
+            freqs = torch.fft.rfftfreq(self.horizon, device=self.device).to(
+                self.dtype
+            )
+            freqs[0] = 1.0
+            noise_scale = freqs.pow(-self.noise_beta / 2)
+            noise_scale[0] = noise_scale[1]
 
             for cb in self.callbacks:
                 cb.start_batch()
 
             for step in range(self.n_steps):
-                # Sample action sequences: (Batch, Num_Samples, Horizon, Dim)
-                candidates = torch.randn(
-                    current_bs,
-                    self.num_samples,
-                    self.horizon,
-                    self.action_dim,
-                    generator=self.torch_gen,
-                    device=self.device,
-                    dtype=self.dtype,
-                )
+                # Colored noise: generate with temporal axis last, then transpose
+                if self.horizon <= 1:
+                    noise = torch.randn(
+                        noise_shape,
+                        generator=self.torch_gen,
+                        device=self.device,
+                        dtype=self.dtype,
+                    )
+                else:
+                    white = torch.randn(
+                        noise_shape,
+                        generator=self.torch_gen,
+                        device=self.device,
+                        dtype=self.dtype,
+                    )
+                    fft = torch.fft.rfft(white, dim=-1)
+                    colored = torch.fft.irfft(
+                        fft * noise_scale, n=self.horizon, dim=-1
+                    )
+                    std = colored.std(dim=-1, keepdim=True).clamp(min=1e-8)
+                    noise = colored / std
+                noise = noise.transpose(
+                    -1, -2
+                )  # -> (bs, num_samples, horizon, action_dim)
 
-                # Scale and shift: (Batch, N, H, D) * (Batch, 1, H, D) + (Batch, 1, H, D)
-                candidates = candidates * batch_var.unsqueeze(
+                candidates = noise * batch_var.unsqueeze(
                     1
                 ) + batch_mean.unsqueeze(1)
-
-                # Force the first sample to be the current mean
                 candidates[:, 0] = batch_mean
 
-                # Evaluate candidates
-                costs = self.model.get_cost(expanded_infos, candidates)
+                # Inject previous elites
+                if prev_topk_candidates is not None:
+                    n_inject = min(
+                        self.n_elite_keep, prev_topk_candidates.shape[1]
+                    )
+                    candidates[:, 1 : 1 + n_inject] = prev_topk_candidates[
+                        :, :n_inject
+                    ]
+
+                # Clip to action bounds
+                if self._action_low is not None:
+                    candidates = candidates.clamp(
+                        self._action_low, self._action_high
+                    )
+
+                costs = self.cost.get_cost(expanded_infos, candidates)
 
                 assert isinstance(costs, torch.Tensor), (
                     f'Expected cost to be a torch.Tensor, got {type(costs)}'
@@ -220,29 +291,24 @@ class CEMSolver:
                     f'Expected cost to be of shape ({current_bs}, {self.num_samples}), got {costs.shape}'
                 )
 
-                # Select Top-K
-                # topk_vals: (Batch, K), topk_inds: (Batch, K)
                 topk_vals, topk_inds = torch.topk(
                     costs, k=self.topk, dim=1, largest=False
                 )
-
-                # Gather Top-K Candidates
-                # We need to select the specific candidates corresponding to topk_inds
-                batch_indices = (
-                    torch.arange(current_bs, device=self.device)
-                    .unsqueeze(1)
-                    .expand(-1, self.topk)
-                )
-
-                # Indexing: candidates[batch_idx, sample_idx]
-                # Result shape: (Batch, K, Horizon, Dim)
                 topk_candidates = candidates[batch_indices, topk_inds]
 
-                # Update Mean and Variance based on Top-K
+                prev_topk_candidates = topk_candidates
+
+                # Momentum update
+                elite_mean = topk_candidates.mean(dim=1)
+                elite_var = topk_candidates.std(dim=1)
                 prev_mean = batch_mean
                 prev_var = batch_var
-                batch_mean = topk_candidates.mean(dim=1)
-                batch_var = topk_candidates.std(dim=1)
+                batch_mean = (
+                    self.alpha * batch_mean + (1 - self.alpha) * elite_mean
+                )
+                batch_var = (
+                    self.alpha * batch_var + (1 - self.alpha) * elite_var
+                )
 
                 for cb in self.callbacks:
                     cb(
@@ -256,17 +322,21 @@ class CEMSolver:
                         var=batch_var,
                         prev_mean=prev_mean,
                         prev_var=prev_var,
+                        action_low=self._action_low,
+                        action_high=self._action_high,
                     )
 
-                # Update final cost for logging
-                # We average the cost of the top elites
+            if self.return_mean:
+                mean[start_idx:end_idx] = batch_mean
+                # Average elite cost as a summary of the returned mean
                 final_batch_cost = topk_vals.mean(dim=1).cpu().tolist()
+            else:
+                mean[start_idx:end_idx] = topk_candidates[:, 0]
+                # Exact cost of the returned best elite
+                final_batch_cost = topk_vals[:, 0].cpu().tolist()
 
-            # Write results back to global storage
-            mean[start_idx:end_idx] = batch_mean
             var[start_idx:end_idx] = batch_var
 
-            # Store history/metadata
             outputs['costs'].extend(final_batch_cost)
 
         outputs['actions'] = mean.detach().cpu()
@@ -279,5 +349,5 @@ class CEMSolver:
                 cb.end_solve()
                 outputs['callbacks'][cb.output_key] = cb.history
 
-        print(f'CEM solve time: {time.time() - start_time:.4f} seconds')
+        print(f'iCEM solve time: {time.time() - start_time:.4f} seconds')
         return outputs

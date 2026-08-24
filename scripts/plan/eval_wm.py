@@ -26,10 +26,22 @@ def img_transform(cfg, dtype=torch.float32):
     return transform
 
 
+def episode_col(dataset):
+    """Name of the episode-index column, robust across dataset formats.
+
+    HDF5 lists every column (including index columns) in ``column_names``,
+    but the Lance reader deliberately excludes its index columns
+    (``episode_idx``/``step_idx``) from ``column_names`` and only exposes
+    them via ``_schema_names``. Consult both so ``episode_idx`` is found
+    regardless of format.
+    """
+    names = set(dataset.column_names)
+    names |= set(getattr(dataset, '_schema_names', ()))
+    return 'episode_idx' if 'episode_idx' in names else 'ep_idx'
+
+
 def get_episodes_length(dataset, episodes):
-    col_name = (
-        'episode_idx' if 'episode_idx' in dataset.column_names else 'ep_idx'
-    )
+    col_name = episode_col(dataset)
 
     episode_idx = dataset.get_col_data(col_name)
     step_idx = dataset.get_col_data('step_idx')
@@ -69,9 +81,12 @@ def eval_model(cfg: DictConfig, model=None) -> dict:
         'goal':   img_transform(cfg, img_dtype),
     }
 
-    dataset     = get_dataset(cfg, cfg.eval.dataset_name)
-    col_name    = 'episode_idx' if 'episode_idx' in dataset.column_names else 'ep_idx'
-    ep_indices, _ = np.unique(dataset.get_col_data(col_name), return_index=True)
+    dataset = get_dataset(cfg, cfg.eval.dataset_name)
+    stats_dataset = dataset  # get_dataset(cfg, cfg.dataset.stats)
+    col_name = episode_col(dataset)
+    ep_indices, _ = np.unique(
+        stats_dataset.get_col_data(col_name), return_index=True
+    )
 
     process = {}
     for col in cfg.dataset.keys_to_cache:
@@ -100,10 +115,12 @@ def eval_model(cfg: DictConfig, model=None) -> dict:
             encoder_attr = 'backbone' if hasattr(model, 'backbone') else 'encoder'
             setattr(model, encoder_attr, torch.compile(getattr(model, encoder_attr)))
             model.predictor = torch.compile(model.predictor)
-        plan_config = swm.PlanConfig(**cfg.plan_config)
-        solver      = hydra.utils.instantiate(cfg.solver, model=model)
-        policy      = swm.policy.WorldModelPolicy(
-            solver=solver, config=plan_config, process=process, transform=transform
+        config = swm.PlanConfig(**cfg.plan_config)
+        objective = hydra.utils.instantiate(cfg.objective)
+        cost = swm.planning.ShootingCostEvaluator(model, objective)
+        solver = hydra.utils.instantiate(cfg.solver, cost=cost, device=device)
+        policy = swm.policy.WorldModelPolicy(
+            solver=solver, config=config, process=process, transform=transform
         )
     else:
         policy = swm.policy.RandomPolicy()
@@ -114,23 +131,34 @@ def eval_model(cfg: DictConfig, model=None) -> dict:
         else Path(__file__).parent
     )
 
-    episode_len    = get_episodes_length(dataset, ep_indices)
-    max_start_idx  = episode_len - cfg.eval.goal_offset_steps - 1
-    max_start_dict = {ep_id: max_start_idx[i] for i, ep_id in enumerate(ep_indices)}
+    # sample the episodes and the starting indices
+    episode_len = get_episodes_length(dataset, ep_indices)
+    max_start_idx = episode_len - cfg.eval.goal_offset_steps - 1
+    max_start_idx_dict = {
+        ep_id: max_start_idx[i] for i, ep_id in enumerate(ep_indices)
+    }
+    # Map each dataset row’s episode_idx to its max_start_idx
+    col_name = episode_col(dataset)
     max_start_per_row = np.array(
-        [max_start_dict[ep_id] for ep_id in dataset.get_col_data(col_name)]
+        [max_start_idx_dict[ep_id] for ep_id in dataset.get_col_data(col_name)]
     )
     valid_mask    = dataset.get_col_data('step_idx') <= max_start_per_row
     valid_indices = np.nonzero(valid_mask)[0]
     print(valid_mask.sum(), 'valid starting points found for evaluation.')
 
     g = np.random.default_rng(cfg.seed)
-    random_episode_indices = np.sort(
-        valid_indices[g.choice(len(valid_indices) - 1, size=cfg.eval.num_eval, replace=False)]
+    random_episode_indices = g.choice(
+        len(valid_indices), size=cfg.eval.num_eval, replace=False
     )
 
-    eval_episodes  = dataset.get_row_data(random_episode_indices)[col_name]
-    eval_start_idx = dataset.get_row_data(random_episode_indices)['step_idx']
+    # sort increasingly to avoid issues with HDF5Dataset indexing
+    random_episode_indices = np.sort(valid_indices[random_episode_indices])
+
+    # Index the full index columns directly: the Lance reader excludes
+    # index columns (episode_idx/step_idx) from get_row_data, but get_col_data
+    # exposes them (and both are already cached from the checks above).
+    eval_episodes = dataset.get_col_data(col_name)[random_episode_indices]
+    eval_start_idx = dataset.get_col_data('step_idx')[random_episode_indices]
 
     if len(eval_episodes) < cfg.eval.num_eval:
         raise ValueError('Not enough episodes with sufficient length for evaluation.')

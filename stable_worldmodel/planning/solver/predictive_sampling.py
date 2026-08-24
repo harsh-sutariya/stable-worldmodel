@@ -4,6 +4,7 @@ Reference: Howell et al., "Predictive Sampling: Real-time Behaviour Synthesis
 with MuJoCo", 2022.
 """
 
+import logging
 import time
 from typing import Any
 
@@ -11,16 +12,17 @@ import gymnasium as gym
 import numpy as np
 import torch
 from gymnasium.spaces import Box
-from loguru import logger as logging
 
 from .solver import Costable
+
+logger = logging.getLogger(__name__)
 
 
 class PredictiveSamplingSolver:
     """Predictive Sampling solver for action optimization.
 
     Args:
-        model: World model implementing the Costable protocol.
+        cost: Cost object to plan against (a Costable, e.g. a ShootingCostEvaluator).
         batch_size: Number of environments to process in parallel.
         num_samples: Number of action candidates to sample.
         noise_scale: Standard deviation of additive Gaussian noise.
@@ -30,21 +32,21 @@ class PredictiveSamplingSolver:
 
     def __init__(
         self,
-        model: Costable,
+        cost: Costable,
         batch_size: int = 1,
         num_samples: int = 300,
         noise_scale: float = 1.0,
         device: str | torch.device = 'cpu',
         seed: int = 1234,
     ) -> None:
-        self.model = model
+        self.cost = cost
         self.batch_size = batch_size
         self.num_samples = num_samples
         self.noise_scale = noise_scale
         self.device = device
         self.torch_gen = torch.Generator(device=device).manual_seed(seed)
         try:
-            self._dtype = next(model.parameters()).dtype
+            self._dtype = next(cost.parameters()).dtype
         except (AttributeError, StopIteration):
             self._dtype = torch.float32
 
@@ -59,7 +61,7 @@ class PredictiveSamplingSolver:
         self._configured = True
 
         if not isinstance(action_space, Box):
-            logging.warning(
+            logger.warning(
                 f'Action space is discrete, got {type(action_space)}. PredictiveSamplingSolver may not work as expected.'
             )
 
@@ -100,7 +102,9 @@ class PredictiveSamplingSolver:
         if remaining > 0:
             device = nominal.device
             pad = torch.zeros(
-                [n_envs, remaining, self.action_dim], dtype=self.dtype
+                [n_envs, remaining, self.action_dim],
+                dtype=self.dtype,
+                device=device,
             )
             nominal = torch.cat([nominal, pad], dim=1).to(device)
 
@@ -162,7 +166,7 @@ class PredictiveSamplingSolver:
             # result is never worse than the warm-start.
             candidates[:, 0] = batch_nominal
 
-            costs = self.model.get_cost(expanded_infos, candidates)
+            costs = self.cost.get_cost(expanded_infos, candidates)
 
             assert isinstance(costs, torch.Tensor), (
                 f'Expected cost to be a torch.Tensor, got {type(costs)}'

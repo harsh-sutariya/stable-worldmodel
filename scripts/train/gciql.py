@@ -1,3 +1,4 @@
+import logging
 import os
 from collections import OrderedDict
 
@@ -7,15 +8,14 @@ import stable_pretraining as spt
 import torch
 from einops import rearrange, repeat
 from lightning.pytorch.callbacks import Callback
-from stable_worldmodel.data import column_normalizer as get_column_normalizer
-from stable_worldmodel.wm.utils import save_pretrained
 from lightning.pytorch.loggers import WandbLogger
-from loguru import logger as logging
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 from transformers import AutoModel
 
 import stable_worldmodel as swm
+from stable_worldmodel.data import column_normalizer as get_column_normalizer
+from stable_worldmodel.wm.utils import save_pretrained
 
 # TODO for now we use AWR to extract a policy from the learned value function.
 # we should implement DDPG style training from the learnt critic as well.
@@ -24,6 +24,10 @@ import stable_worldmodel as swm
 # ============================================================================
 # Data Setup
 # ============================================================================
+
+logger = logging.getLogger(__name__)
+
+
 def get_data(cfg, goal_probabilities):
     """Setup dataset with image transforms and normalization."""
 
@@ -97,11 +101,11 @@ def get_data(cfg, goal_probabilities):
             lengths=[train_subset_fraction, 1 - train_subset_fraction],
             generator=rnd_gen,
         )
-        logging.info(
+        logger.info(
             f'Using {train_subset_fraction:.1%} of training data: {len(train_set)} samples'
         )
 
-    logging.info(f'Train: {len(train_set)}, Val: {len(val_set)}')
+    logger.info(f'Train: {len(train_set)}, Val: {len(val_set)}')
 
     train = DataLoader(
         train_set,
@@ -177,7 +181,7 @@ def get_gciql_critics_model(cfg):
         }
         for name, tensor in nan_checks.items():
             if tensor is not None and torch.isnan(tensor).any():
-                logging.warning(
+                logger.warning(
                     f'NaN detected in {name}! '
                     f'count={torch.isnan(tensor).sum().item()}, '
                     f'shape={tensor.shape}'
@@ -286,17 +290,17 @@ def get_gciql_critics_model(cfg):
 
         # NaN detection after value prediction
         if torch.isnan(v).any():
-            logging.warning(
+            logger.warning(
                 f'NaN in value_pred! count={torch.isnan(v).sum().item()}'
             )
         if torch.isnan(q).any():
-            logging.warning(
+            logger.warning(
                 f'NaN in q target! count={torch.isnan(q).sum().item()}'
             )
 
         # NaN detection after loss computation
         if torch.isnan(value_loss):
-            logging.warning(
+            logger.warning(
                 f'NaN in value_loss! '
                 f'value_pred range: [{value_pred.min().item():.4f}, {value_pred.max().item():.4f}], '
                 f'value_target range: [{value_target.min().item():.4f}, {value_target.max().item():.4f}]'
@@ -483,7 +487,7 @@ def get_gciql_critics_model(cfg):
         encoder = AutoModel.from_pretrained('facebook/dinov2-small')
         embedding_dim = encoder.config.hidden_size
         encoder_trainable = False
-        logging.info('Using pretrained frozen DINO encoder')
+        logger.info('Using pretrained frozen DINO encoder')
     elif encoder_type == 'vit_tiny':
         # Load trainable ViT tiny from scratch
         encoder = spt.backbone.utils.vit_hf(
@@ -495,7 +499,7 @@ def get_gciql_critics_model(cfg):
         )
         embedding_dim = encoder.config.hidden_size
         encoder_trainable = True
-        logging.info('Using trainable ViT tiny encoder (from scratch)')
+        logger.info('Using trainable ViT tiny encoder (from scratch)')
     else:
         raise ValueError(f'Unknown encoder_type: {encoder_type}')
 
@@ -507,7 +511,7 @@ def get_gciql_critics_model(cfg):
     if cfg.dinowm.get('use_proprio_encoder', True):
         embedding_dim += cfg.dinowm.proprio_embed_dim  # Total embedding size
 
-    logging.info(f'Patches: {num_patches}, Embedding dim: {embedding_dim}')
+    logger.info(f'Patches: {num_patches}, Embedding dim: {embedding_dim}')
 
     # Build causal predictor (transformer that predicts next actions)
     effective_act_dim = (
@@ -565,7 +569,7 @@ def get_gciql_critics_model(cfg):
         )
         extra_encoders = torch.nn.ModuleDict(extra_encoders)
 
-    logging.info(
+    logger.info(
         f'Action dim: {effective_act_dim}, Proprio encoder: {extra_encoders is not None}'
     )
 
@@ -871,6 +875,9 @@ def run(cfg):
     gciql_critics_model = get_gciql_critics_model(cfg)
 
     cache_dir = swm.data.utils.get_cache_dir(sub_folder='checkpoints')
+    value_ckpt_path = cache_dir / (
+        f'{cfg.output_model_name}_value_weights.ckpt'
+    )
 
     if cfg.get('train_value', True):
         dump_object_callback = SaveCkptCallback(
@@ -892,7 +899,7 @@ def run(cfg):
             trainer=trainer,
             module=gciql_critics_model,
             data=data,
-            ckpt_path=f'{cache_dir}/{cfg.output_model_name}_value_weights.ckpt',
+            ckpt_path=value_ckpt_path if value_ckpt_path.exists() else None,
         )
         manager()
 
@@ -906,11 +913,11 @@ def run(cfg):
     )
     data = get_data(cfg, goal_probabilities=goal_probs)
 
-    # load value function weights
-    checkpoint = torch.load(
-        f'{cache_dir}/{cfg.output_model_name}_value_weights.ckpt'
-    )
-    gciql_critics_model.load_state_dict(checkpoint['state_dict'])
+    # A freshly trained critic is already available in memory. Only load a
+    # checkpoint when value training was explicitly skipped.
+    if not cfg.get('train_value', True):
+        checkpoint = torch.load(value_ckpt_path)
+        gciql_critics_model.load_state_dict(checkpoint['state_dict'])
 
     gciql_actor_model = get_gciql_actor_model(cfg, gciql_critics_model)
 
@@ -928,14 +935,21 @@ def run(cfg):
         enable_checkpointing=True,
     )
 
+    policy_ckpt_path = cache_dir / (
+        f'{cfg.output_model_name}_policy_weights.ckpt'
+    )
     manager = spt.Manager(
         trainer=trainer,
         module=gciql_actor_model,
         data=data,
-        ckpt_path=f'{cache_dir}/{cfg.output_model_name}_policy_weights.ckpt',
+        ckpt_path=policy_ckpt_path if policy_ckpt_path.exists() else None,
     )
     manager()
 
 
 if __name__ == '__main__':
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(levelname)s | %(name)s | %(message)s',
+    )
     run()

@@ -8,15 +8,12 @@ import torch
 from gymnasium import spaces as gym_spaces
 
 from stable_worldmodel.policy import (
-    AutoActionableModel,
-    AutoCostModel,
     BasePolicy,
     ExpertPolicy,
     FeedForwardPolicy,
     PlanConfig,
     RandomPolicy,
     WorldModelPolicy,
-    _load_model_with_attribute,
 )
 
 
@@ -47,6 +44,12 @@ def test_plan_config_frozen():
     config = PlanConfig(horizon=10, receding_horizon=5)
     with pytest.raises(Exception):  # FrozenInstanceError
         config.horizon = 20
+
+
+@pytest.mark.parametrize('history_len', [0, -1])
+def test_plan_config_rejects_non_positive_history_len(history_len):
+    with pytest.raises(ValueError, match='history_len'):
+        PlanConfig(horizon=10, receding_horizon=5, history_len=history_len)
 
 
 ###########################
@@ -114,19 +117,19 @@ def test_random_policy_get_action():
 
 
 def test_random_policy_set_seed():
-    """Test RandomPolicy.set_seed method."""
-    policy = RandomPolicy(seed=42)
+    """Test that set_env auto-applies the constructor seed to the action space."""
+    policy = RandomPolicy(seed=123)
     mock_env = MagicMock()
     policy.set_env(mock_env)
-    policy.set_seed(123)
     mock_env.action_space.seed.assert_called_once_with(123)
 
 
-def test_random_policy_set_seed_no_env():
-    """Test RandomPolicy.set_seed when env is None."""
-    policy = RandomPolicy(seed=42)
-    # Should not raise
-    policy.set_seed(123)
+def test_random_policy_set_env_no_seed_skips_seeding():
+    """Test that set_env does not seed the action space when seed is None."""
+    policy = RandomPolicy()
+    mock_env = MagicMock()
+    policy.set_env(mock_env)
+    mock_env.action_space.seed.assert_not_called()
 
 
 ###########################
@@ -210,6 +213,29 @@ def test_prepare_info_process_non_numpy_raises():
     info = {'state': torch.tensor([1.0, 2.0])}  # Tensor instead of numpy
     with pytest.raises(ValueError, match='Expected numpy array'):
         policy._prepare_info(info)
+
+
+def test_prepare_info_with_block_aggregated_key():
+    """Process keys whose last dim is a multiple of n_features_in_ flatten to (-1, n_features_in_).
+
+    Mirrors the action history path where HistoryBuffer with block_keys=('action',)
+    returns shape (n_envs, k, action_block * D) but the scaler was fit on D features.
+    """
+    policy = BasePolicy()
+    scaler = MockTransformable(scale=2.0)
+    scaler.n_features_in_ = 2  # sklearn convention
+    policy.process = {'action': scaler}
+    # Shape: (n_envs=1, k=2, action_block * D = 2 * 2 = 4)
+    info = {
+        'action': np.array(
+            [[[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]],
+            dtype=np.float32,
+        )
+    }
+    result = policy._prepare_info(info)
+    assert result['action'].shape == (1, 2, 4)
+    expected = torch.tensor([[[2.0, 4.0, 6.0, 8.0], [10.0, 12.0, 14.0, 16.0]]])
+    torch.testing.assert_close(result['action'], expected)
 
 
 def test_prepare_info_string_dtype_not_converted():
@@ -410,6 +436,57 @@ def test_worldmodel_policy_set_env():
     assert solver.configured
     assert solver.n_envs == 4
     assert policy._action_buffer is not None
+
+
+def test_worldmodel_policy_history_buffer_max_len():
+    """Auto-derived max_len is the smallest capacity yielding history_len
+    strided frames: (history_len - 1) * action_block + 1. The leaving-block
+    windows sit strictly between the frames, so no extra entries are needed
+    for the history_len - 1 action blocks."""
+    solver = MockSolver()
+    config = PlanConfig(
+        horizon=10, receding_horizon=2, history_len=4, action_block=3
+    )
+    policy = WorldModelPolicy(solver=solver, config=config)
+
+    mock_env = MagicMock()
+    mock_env.num_envs = 1
+    mock_env.action_space = gym_spaces.Box(low=-1, high=1, shape=(2,))
+    mock_env.single_action_space = mock_env.action_space
+    policy.set_env(mock_env)
+
+    assert policy._history_buffer is not None
+    assert policy._history_buffer.max_len == 10  # (4 - 1) * 3 + 1
+
+    for i in range(10):
+        policy._history_buffer.append(
+            {'action': np.full((1, 1, 2), i, dtype=np.float32)}
+        )
+    out = policy._history_buffer.get(config.history_len)
+    assert out is not None
+    # (n_envs, history_len - 1, action_block * D): blocks between frames
+    assert out['action'].shape == (1, 3, 6)
+
+
+def test_worldmodel_policy_history_max_len_explicit():
+    """Explicit history_max_len overrides the auto-derivation."""
+    solver = MockSolver()
+    config = PlanConfig(
+        horizon=10,
+        receding_horizon=2,
+        history_len=3,
+        history_max_len=20,
+        action_block=2,
+    )
+    policy = WorldModelPolicy(solver=solver, config=config)
+
+    mock_env = MagicMock()
+    mock_env.num_envs = 1
+    mock_env.action_space = gym_spaces.Box(low=-1, high=1, shape=(2,))
+    mock_env.single_action_space = mock_env.action_space
+    policy.set_env(mock_env)
+
+    assert policy._history_buffer.max_len == 20
 
 
 def test_worldmodel_policy_set_env_no_num_envs():
@@ -662,7 +739,7 @@ class MockSolverWithWarmStart:
         return self._config.horizon
 
     def solve(self, info_dict: dict, init_action=None) -> dict:
-        from stable_worldmodel.solver.utils import prepare_init_action
+        from stable_worldmodel.planning.solver.utils import prepare_init_action
 
         init_action = prepare_init_action(
             self.model,
@@ -783,133 +860,251 @@ def test_worldmodel_policy_no_warmstart_without_actionable():
     assert solver.received_init_action.eq(0).all()
 
 
-###########################
-## Auto Loading Tests    ##
-###########################
+#########################################
+## Planning-time history (history_len) ##
+#########################################
 
 
-class MockModuleWithGetAction(torch.nn.Module):
-    """Mock module with get_action method."""
-
-    def __init__(self):
-        super().__init__()
-        self.linear = torch.nn.Linear(4, 2)
-
-    def get_action(self, info):
-        return torch.zeros(2)
-
-
-class MockModuleWithGetCost(torch.nn.Module):
-    """Mock module with get_cost method."""
+class RecordingBlockSolver:
+    """MockSolver variant for history tests: records every received info
+    dict and returns call-tagged actions in blocked solver space
+    (base_action_dim * action_block), so executed blocks are identifiable."""
 
     def __init__(self):
-        super().__init__()
-        self.linear = torch.nn.Linear(4, 1)
+        self.received = []
+        self._config = None
 
-    def get_cost(self, info):
-        return torch.zeros(1)
+    def configure(self, *, action_space, n_envs, config):
+        self._action_space = action_space
+        self._n_envs = n_envs
+        self._config = config
 
+    @property
+    def action_dim(self) -> int:
+        return self._action_space.shape[-1] * self._config.action_block
 
-class MockParentModule(torch.nn.Module):
-    """Mock parent module containing child with attribute."""
+    @property
+    def n_envs(self) -> int:
+        return self._n_envs
 
-    def __init__(self, child):
-        super().__init__()
-        self.encoder = torch.nn.Linear(10, 10)
-        self.child = child
+    @property
+    def horizon(self) -> int:
+        return self._config.horizon
 
+    def solve(self, info_dict, init_action=None):
+        self.received.append(
+            {
+                k: (v.clone() if torch.is_tensor(v) else v)
+                for k, v in info_dict.items()
+            }
+        )
+        batch = len(next(iter(info_dict.values())))
+        base = 1000.0 * len(self.received)
+        actions = base + torch.arange(
+            batch * self._config.horizon * self.action_dim,
+            dtype=torch.float32,
+        ).reshape(batch, self._config.horizon, self.action_dim)
+        return {'actions': actions}
 
-@pytest.fixture
-def mock_checkpoint_dir(tmp_path):
-    """Create a temporary checkpoint directory."""
-    return tmp_path
-
-
-def test_load_model_with_attribute_direct(mock_checkpoint_dir):
-    """Test _load_model_with_attribute finds attribute directly from directory."""
-    model = MockModuleWithGetAction()
-    ckpt_path = mock_checkpoint_dir / 'direct_object.ckpt'
-    torch.save(model, ckpt_path)
-
-    # Pass directory - it will find the *_object.ckpt file
-    result = _load_model_with_attribute(str(mock_checkpoint_dir), 'get_action')
-    assert hasattr(result, 'get_action')
-
-
-def test_load_model_with_attribute_nested(mock_checkpoint_dir):
-    """Test _load_model_with_attribute finds nested attribute."""
-    child = MockModuleWithGetAction()
-    parent = MockParentModule(child)
-    # Create a subdirectory for this test
-    nested_dir = mock_checkpoint_dir / 'nested_test'
-    nested_dir.mkdir()
-    ckpt_path = nested_dir / 'model_object.ckpt'
-    torch.save(parent, ckpt_path)
-
-    result = _load_model_with_attribute(str(nested_dir), 'get_action')
-    assert hasattr(result, 'get_action')
+    def __call__(self, info_dict, init_action=None):
+        return self.solve(info_dict, init_action)
 
 
-def test_load_model_with_attribute_from_dir(mock_checkpoint_dir):
-    """Test _load_model_with_attribute loads from directory."""
-    model = MockModuleWithGetAction()
-    subdir = mock_checkpoint_dir / 'from_dir'
-    subdir.mkdir()
-    ckpt_path = subdir / 'model_object.ckpt'
-    torch.save(model, ckpt_path)
-
-    result = _load_model_with_attribute(str(subdir), 'get_action')
-    assert hasattr(result, 'get_action')
-
-
-def test_load_model_with_attribute_not_found(mock_checkpoint_dir):
-    """Test _load_model_with_attribute raises when attribute not found."""
-    model = torch.nn.Linear(4, 2)  # No get_action
-    subdir = mock_checkpoint_dir / 'no_attr'
-    subdir.mkdir()
-    ckpt_path = subdir / 'test_object.ckpt'
-    torch.save(model, ckpt_path)
-
-    with pytest.raises(
-        RuntimeError, match="No module with 'get_action' found"
-    ):
-        _load_model_with_attribute(str(subdir), 'get_action')
+def _history_env(n_envs=1):
+    mock_env = MagicMock()
+    mock_env.num_envs = n_envs
+    mock_env.single_action_space = gym_spaces.Box(low=-1, high=1, shape=(2,))
+    if n_envs == 1:
+        mock_env.action_space = mock_env.single_action_space
+    else:
+        mock_env.action_space = gym_spaces.Box(
+            low=-1, high=1, shape=(n_envs, 2)
+        )
+    return mock_env
 
 
-def test_load_model_with_attribute_cache_dir(mock_checkpoint_dir):
-    """Test _load_model_with_attribute uses cache_dir."""
-    model = MockModuleWithGetAction()
-    run_name = 'my_model'
-    run_dir = mock_checkpoint_dir / run_name
-    run_dir.mkdir()
-    ckpt_path = run_dir / 'epoch_0_object.ckpt'
-    torch.save(model, ckpt_path)
+def _step_info(step, n_envs=1, action=None):
+    """Env-step info: pixels tagged with the step index; ``action`` is the
+    env echo of the previously executed action (NaN at reset, like
+    EverythingToInfoWrapper)."""
+    if action is None:
+        action = np.full((n_envs, 1, 2), np.nan, dtype=np.float32)
+    return {
+        'pixels': np.full((n_envs, 1, 8, 8, 3), float(step), dtype=np.float32),
+        'goal': np.zeros((n_envs, 1, 8, 8, 3), dtype=np.float32),
+        'action': np.asarray(action, dtype=np.float32).reshape(n_envs, 1, 2),
+    }
 
-    result = _load_model_with_attribute(
-        run_name, 'get_action', cache_dir=mock_checkpoint_dir
+
+def _history_policy(n_envs=1, history_len=3):
+    solver = RecordingBlockSolver()
+    config = PlanConfig(
+        horizon=4,
+        receding_horizon=3,
+        history_len=history_len,
+        action_block=2,
     )
-    assert hasattr(result, 'get_action')
+    policy = WorldModelPolicy(solver=solver, config=config)
+    policy.set_env(_history_env(n_envs))
+    return policy, solver
 
 
-def test_auto_actionable_model(mock_checkpoint_dir):
-    """Test AutoActionableModel function."""
-    model = MockModuleWithGetAction()
-    subdir = mock_checkpoint_dir / 'actionable'
-    subdir.mkdir()
-    ckpt_path = subdir / 'test_object.ckpt'
-    torch.save(model, ckpt_path)
+def test_history_len_one_keeps_single_frame_surface():
+    """Default history_len=1 is surface-compatible with the old behavior:
+    single-frame pixels, no action_history key, no history buffer."""
+    policy, solver = _history_policy(history_len=1)
+    assert policy._history_buffer is None
 
-    result = AutoActionableModel(str(subdir))
-    assert hasattr(result, 'get_action')
+    info = {
+        'pixels': np.random.rand(1, 1, 8, 8, 3).astype(np.float32),
+        'goal': np.random.rand(1, 1, 8, 8, 3).astype(np.float32),
+    }
+    policy.get_action(info)
+
+    rec = solver.received[0]
+    assert rec['pixels'].shape[1] == 1
+    assert 'action_history' not in rec
 
 
-def test_auto_cost_model(mock_checkpoint_dir):
-    """Test AutoCostModel function."""
-    model = MockModuleWithGetCost()
-    subdir = mock_checkpoint_dir / 'costable'
-    subdir.mkdir()
-    ckpt_path = subdir / 'test_object.ckpt'
-    torch.save(model, ckpt_path)
+def test_history_stacks_block_boundary_frames_and_executed_blocks():
+    """At a replan the solver receives the frames at the last history_len
+    block boundaries and the executed solver-space blocks between them."""
+    policy, solver = _history_policy()
 
-    result = AutoCostModel(str(subdir))
-    assert hasattr(result, 'get_cost')
+    action = None
+    for step in range(7):  # replans at steps 0 and 6 (receding 3 * block 2)
+        action = policy.get_action(_step_info(step, action=action))
+
+    assert len(solver.received) == 2
+
+    # episode start: a single real frame, no padding, no action history
+    first = solver.received[0]
+    torch.testing.assert_close(first['pixels'][0, :, 0, 0, 0], torch.zeros(1))
+    assert 'action_history' not in first
+
+    # second replan: frames at block boundaries 2, 4, 6
+    second = solver.received[1]
+    torch.testing.assert_close(
+        second['pixels'][0, :, 0, 0, 0], torch.tensor([2.0, 4.0, 6.0])
+    )
+    # executed blocks between those frames are the first plan's blocked
+    # rows 1 and 2 (row r covers env steps 2r, 2r+1), echoed back by the
+    # env one step later
+    plan0 = 1000.0 + torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    torch.testing.assert_close(second['action_history'][0], plan0[1:3])
+
+
+def test_history_flush_resets_to_single_reset_frame():
+    """_needs_flush clears the history; the reset frame enters exactly once
+    and the immediate replan sees only that frame, with no stale context
+    and no action history."""
+    policy, solver = _history_policy()
+
+    action = None
+    for step in range(7):
+        action = policy.get_action(_step_info(step, action=action))
+
+    reset_info = _step_info(99)  # NaN action echo, like a real reset
+    reset_info['_needs_flush'] = np.array([True])
+    policy.get_action(reset_info)
+
+    assert len(policy._history_buffer._buffers[0]) == 1
+    rec = solver.received[-1]
+    torch.testing.assert_close(
+        rec['pixels'][0, :, 0, 0, 0], torch.full((1,), 99.0)
+    )
+    assert 'action_history' not in rec
+
+
+def test_history_dead_env_not_replanned():
+    """Dead envs are excluded from the replan batch and its history rows."""
+    policy, solver = _history_policy(n_envs=2)
+
+    info = _step_info(0, n_envs=2)
+    info['terminated'] = np.array([False, True])
+    policy.get_action(info)
+
+    rec = solver.received[0]
+    assert rec['pixels'].shape[0] == 1
+    assert rec['pixels'].shape[1] == 1  # first plan: 1-frame context
+    assert 'action_history' not in rec
+
+
+def test_history_selective_replan_uses_env_own_history():
+    """A desynchronized env replans from its own per-env history; the other
+    env's buffers and plan are untouched (no cross-env coupling)."""
+    policy, solver = _history_policy(n_envs=2)
+
+    action = None
+    action = policy.get_action(_step_info(0, n_envs=2, action=action))
+    # env 0 forced to replan mid-block (e.g. external reset of its plan)
+    policy._action_buffer[0].clear()
+    policy.get_action(_step_info(1, n_envs=2, action=action))
+
+    rec = solver.received[-1]
+    assert rec['pixels'].shape[0] == 1
+    # env 0 has entries for steps 0 and 1 only: one strided frame (step 1)
+    # and no executed blocks yet -> 1-frame context, no action history
+    torch.testing.assert_close(rec['pixels'][0, :, 0, 0, 0], torch.ones(1))
+    assert 'action_history' not in rec
+    # env 1 kept draining its plan
+    assert len(policy._action_buffer[1]) == 4
+
+
+def test_history_context_grows_without_padding():
+    """Early replans receive only the real frames accumulated so far: the
+    context grows 1 -> history_len across block boundaries, with no
+    synthetic frames and an action history of matching length."""
+    solver = RecordingBlockSolver()
+    config = PlanConfig(
+        horizon=4,
+        receding_horizon=1,
+        history_len=3,
+        action_block=2,
+    )
+    policy = WorldModelPolicy(solver=solver, config=config)
+    policy.set_env(_history_env())
+
+    action = None
+    for step in range(7):  # replans every 2 steps: 0, 2, 4, 6
+        action = policy.get_action(_step_info(step, action=action))
+
+    frames = [rec['pixels'][0, :, 0, 0, 0] for rec in solver.received]
+    torch.testing.assert_close(frames[0], torch.tensor([0.0]))
+    torch.testing.assert_close(frames[1], torch.tensor([0.0, 2.0]))
+    torch.testing.assert_close(frames[2], torch.tensor([0.0, 2.0, 4.0]))
+    torch.testing.assert_close(frames[3], torch.tensor([2.0, 4.0, 6.0]))
+
+    assert 'action_history' not in solver.received[0]
+    assert solver.received[1]['action_history'].shape == (1, 1, 4)
+    assert solver.received[2]['action_history'].shape == (1, 2, 4)
+    assert solver.received[3]['action_history'].shape == (1, 2, 4)
+
+
+def test_history_mixed_fill_batch_pads_only_short_env():
+    """When a replan batch mixes a freshly reset env with a full-history
+    env, the context length follows the fullest env and only the short
+    env is padded (repeat-oldest frames, zero action blocks)."""
+    policy, solver = _history_policy(n_envs=2)
+
+    action = None
+    for step in range(7):
+        action = policy.get_action(_step_info(step, n_envs=2, action=action))
+
+    # env 0 resets (flush); env 1 is forced to replan alongside it
+    policy._action_buffer[1].clear()
+    info = _step_info(99, n_envs=2)
+    info['_needs_flush'] = np.array([True, False])
+    policy.get_action(info)
+
+    rec = solver.received[-1]
+    assert rec['pixels'].shape[0] == 2
+    # short env: its single real frame repeated, zero action blocks
+    torch.testing.assert_close(
+        rec['pixels'][0, :, 0, 0, 0], torch.full((3,), 99.0)
+    )
+    torch.testing.assert_close(rec['action_history'][0], torch.zeros(2, 4))
+    # full env: real strided frames from its own past
+    torch.testing.assert_close(
+        rec['pixels'][1, :, 0, 0, 0], torch.tensor([3.0, 5.0, 99.0])
+    )

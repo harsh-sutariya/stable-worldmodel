@@ -10,6 +10,7 @@ from PIL import Image
 
 import h5py
 
+from _guards import require_torchcodec
 from stable_worldmodel.data import (
     ImageDataset,
     VideoDataset,
@@ -143,6 +144,11 @@ def sample_image_dataset_short_episode(tmp_path):
 @pytest.fixture
 def sample_video_dataset(tmp_path):
     """Create a sample VideoDataset directory structure with MP4 files for testing."""
+    # VideoDataset decodes via torchcodec, which needs FFmpeg shared libraries
+    # at decode time — often missing on CI runners — so skip every test that
+    # builds a VideoDataset when the backend can't load.
+    require_torchcodec()
+
     import imageio.v3 as iio
 
     dataset_path = tmp_path / 'test_video_dataset'
@@ -656,16 +662,17 @@ def test_video_dataset_load_file(sample_video_dataset):
     assert frame.shape == (64, 64, 3)
 
 
-def test_video_dataset_backend_import_error(sample_video_dataset):
-    """VideoDataset raises ImportError when no decoder backend is installed."""
-    cache_dir, name = sample_video_dataset
-
-    # Reset the cached factory and hide both backends.
-    VideoDataset._make_reader = None
-    with patch.dict(sys.modules, {'decord': None, 'av': None}):
-        with pytest.raises(ImportError, match='VideoDataset requires'):
-            VideoDataset(name, cache_dir=str(cache_dir))
-    VideoDataset._make_reader = None  # re-resolve for later tests
+def test_video_dataset_backend_import_error(tmp_path):
+    """VideoDataset raises ImportError when the torchcodec backend is missing."""
+    # VideoDataset.__init__ eagerly imports torchcodec before touching any
+    # files, so hiding it forces the ImportError regardless of on-disk layout
+    # (and without needing a working FFmpeg, so this runs even where the other
+    # video tests skip).
+    with patch.dict(
+        sys.modules, {'torchcodec': None, 'torchcodec.decoders': None}
+    ):
+        with pytest.raises(ImportError):
+            VideoDataset('nonexistent', cache_dir=str(tmp_path))
 
 
 ##############################################################################

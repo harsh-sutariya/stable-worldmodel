@@ -12,6 +12,7 @@ def prepare_init_action(
     horizon: int,
     n_envs: int,
     action_dim: int,
+    device: str | torch.device | None = None,
 ) -> torch.Tensor:
     """Extend or generate an initial action sequence to cover the full horizon.
 
@@ -31,9 +32,12 @@ def prepare_init_action(
         horizon: Full planning horizon expected by the solver.
         n_envs: Number of parallel environments.
         action_dim: Flattened action dimension.
+        device: Target device for the returned tensor (typically the solver's
+            device). When ``None``, the device is borrowed from ``init_action``
+            if given, otherwise torch's default device is used.
 
     Returns:
-        Action tensor of shape ``(n_envs, horizon, action_dim)``.
+        Action tensor of shape ``(n_envs, horizon, action_dim)`` on ``device``.
     """
     if init_action is not None:
         assert init_action.shape[0] == n_envs, (
@@ -42,6 +46,8 @@ def prepare_init_action(
         assert init_action.shape[2] == action_dim, (
             f'init_action action_dim {init_action.shape[2]} != action_dim {action_dim}'
         )
+        if device is not None:
+            init_action = init_action.to(device)
 
     n_prev = init_action.shape[1] if init_action is not None else 0
     remaining = horizon - n_prev
@@ -50,7 +56,8 @@ def prepare_init_action(
         return init_action
 
     if not isinstance(model, Actionable):
-        device = init_action.device if init_action is not None else 'cpu'
+        if device is None:
+            device = init_action.device if init_action is not None else 'cpu'
         tail = torch.zeros(n_envs, remaining, action_dim, device=device)
         if init_action is not None:
             return torch.cat([init_action, tail], dim=1)
@@ -62,6 +69,8 @@ def prepare_init_action(
         )
         # tail: (n_envs, remaining, action_dim)
 
+    if device is not None:
+        tail = tail.to(device)
     if init_action is not None:
         return torch.cat([init_action.to(tail.device), tail], dim=1)
     return tail
