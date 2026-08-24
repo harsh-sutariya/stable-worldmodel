@@ -19,6 +19,15 @@ data:
 trainer:
   max_epochs: 10
 
+# AGIR losses — disabled by default so plain LeWM baseline is reproducible.
+# To replicate the AGIR run (94% success on PushT): set curv.weight=0.01, agir.weight=0.01
+loss:
+  curv:
+    weight: 0.0
+  agir:
+    weight: 0.0
+    sigma_act: 1.0
+
 # Run probing + CEM planning automatically after training
 post_training:
   run_probe: true
