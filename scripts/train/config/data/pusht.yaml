@@ -57,7 +57,7 @@ post_training:
       _target_: stable_worldmodel.planning.GoalMSE
     # CEM solver (Paper Appendix E)
     solver:
-      _target_: stable_worldmodel.solver.CEMSolver
+      _target_: stable_worldmodel.planning.solver.CEMSolver
       cost: ???
       batch_size: 1
       num_samples: 300
