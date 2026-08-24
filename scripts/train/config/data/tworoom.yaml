@@ -18,6 +18,14 @@ data:
 wm:
   history_size: 1
 
+# AGIR losses — active for this branch
+loss:
+  curv:
+    weight: 0.01
+  agir:
+    weight: 0.01
+    sigma_act: 1.0
+
 trainer:
   max_epochs: 10
 
