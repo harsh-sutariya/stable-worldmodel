@@ -1,0 +1,12 @@
+# @package _global_
+
+# Single-frame windows for probing PushT representations
+data:
+  dataset:
+    num_steps: 1
+    frameskip: 1
+    name: galilai-group/lewm-pusht
+    keys_to_load:
+      - pixels
+      - state
+      - proprio
