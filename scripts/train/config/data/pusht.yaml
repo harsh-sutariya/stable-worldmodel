@@ -15,6 +15,19 @@ data:
       - proprio
       - state
 
+# Paper (Appendix D): PushT-specific training overrides
+trainer:
+  max_epochs: 10
+
+# AGIR losses — disabled by default so plain LeWM baseline is reproducible.
+# To replicate the AGIR run (94% success on PushT): set curv.weight=0.01, agir.weight=0.01
+loss:
+  curv:
+    weight: 0.0
+  agir:
+    weight: 0.0
+    sigma_act: 1.0
+
 # Run probing + CEM planning automatically after training
 post_training:
   run_probe: true
@@ -31,6 +44,7 @@ post_training:
     batch_size: 512
     probe_levels: [encoder_cls, encoder_patches, projector]
     probe_targets: [state, proprio]
+    max_train_samples: 50000   # cap Ridge fit; PushT full set (~2M) OOMs float64 SVD
 
   eval:
     # Environment

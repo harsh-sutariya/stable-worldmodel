@@ -35,7 +35,9 @@ def _encode_batch(model, pixels: torch.Tensor, device: str) -> dict[str, np.ndar
     pixels: (B, 1, C, H, W) — single-frame windows from the dataset.
     Returns dict {level_name: (B, D) float32 ndarray}.
     """
-    x = pixels.squeeze(1).to(device)  # (B, C, H, W)
+    enc_device = next(model.encoder.parameters()).device
+    enc_dtype = next(model.encoder.parameters()).dtype
+    x = pixels.squeeze(1).to(device=enc_device, dtype=enc_dtype)
     with torch.no_grad():
         out = model.encoder(x, interpolate_pos_encoding=True)
         hidden = out.last_hidden_state  # (B, L+1, D)
@@ -187,10 +189,19 @@ def probe_model(model, probe_cfg, device: str) -> dict[str, dict]:
     train_set, val_set = spt.data.random_split(
         dataset, [cfg_d['train_split'], 1 - cfg_d['train_split']], generator=rng
     )
+
+    # Subsample training set to avoid OOM in Ridge SVD (e.g. PushT has ~2M frames)
+    max_train = cfg_d.get('max_train_samples', None)
+    if max_train is not None and len(train_set) > max_train:
+        indices = torch.randperm(len(train_set), generator=rng)[:max_train].tolist()
+        train_set = torch.utils.data.Subset(train_set, indices)
+        logging.info(f'[probe] subsampled train set to {len(train_set):,} frames (max_train_samples={max_train})')
+
+    num_workers = cfg_d.get('num_workers', 0)
     train_loader = DataLoader(train_set, batch_size=cfg_d.get('batch_size', 512),
-                              shuffle=False, num_workers=2, drop_last=False)
+                              shuffle=False, num_workers=num_workers, drop_last=False)
     val_loader   = DataLoader(val_set,   batch_size=cfg_d.get('batch_size', 512),
-                              shuffle=False, num_workers=2, drop_last=False)
+                              shuffle=False, num_workers=num_workers, drop_last=False)
 
     try:
         logging.info(f'[probe] encoding {len(train_set):,} train / {len(val_set):,} val frames...')
