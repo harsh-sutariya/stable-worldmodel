@@ -1,5 +1,6 @@
 """Model Predictive Path Integral solver for model-based planning."""
 
+import logging
 import time
 from typing import Any
 
@@ -7,17 +8,18 @@ import gymnasium as gym
 import numpy as np
 import torch
 from gymnasium.spaces import Box
-from loguru import logger as logging
 
-from stable_worldmodel.solver.utils import prepare_init_action
+from .utils import prepare_init_action
 from .solver import Costable
+
+logger = logging.getLogger(__name__)
 
 
 class MPPISolver:
     """Model Predictive Path Integral solver for action optimization.
 
     Args:
-        model: World model implementing the Costable protocol.
+        cost: Cost object to plan against (a Costable, e.g. a ShootingCostEvaluator).
         batch_size: Number of environments to process in parallel.
         num_samples: Number of action candidates to sample per iteration.
         var_scale: Initial variance scale for action noise.
@@ -30,7 +32,7 @@ class MPPISolver:
 
     def __init__(
         self,
-        model: Costable,
+        cost: Costable,
         batch_size: int = 1,
         num_samples: int = 300,
         var_scale: float = 1.0,
@@ -40,7 +42,7 @@ class MPPISolver:
         device: str | torch.device = 'cpu',
         seed: int = 1234,
     ) -> None:
-        self.model = model
+        self.cost = cost
         self.batch_size = batch_size
         self.num_samples = num_samples
         self.topk = topk
@@ -50,7 +52,7 @@ class MPPISolver:
         self.device = device
         self.torch_gen = torch.Generator(device=device).manual_seed(seed)
         try:
-            self._dtype = next(model.parameters()).dtype
+            self._dtype = next(cost.parameters()).dtype
         except (AttributeError, StopIteration):
             self._dtype = torch.float32
 
@@ -65,7 +67,7 @@ class MPPISolver:
         self._configured = True
 
         if not isinstance(action_space, Box):
-            logging.warning(
+            logger.warning(
                 f'Action space is discrete, got {type(action_space)}. MPPISolver may not work as expected.'
             )
 
@@ -109,7 +111,9 @@ class MPPISolver:
         if remaining > 0:
             device = mean.device
             new_mean = torch.zeros(
-                [n_envs, remaining, self.action_dim], dtype=self.dtype
+                [n_envs, remaining, self.action_dim],
+                dtype=self.dtype,
+                device=device,
             )
             mean = torch.cat([mean, new_mean], dim=1).to(device)
 
@@ -132,12 +136,13 @@ class MPPISolver:
 
         # -- warm-start from actor if model is Actionable, else zero-pad
         init_action = prepare_init_action(
-            self.model,
+            self.cost,
             info_dict,
             init_action,
             self.horizon,
             n_envs=total_envs,
             action_dim=self.action_dim,
+            device=self.device,
         )
 
         # -- initialize the action distribution globally
@@ -197,7 +202,7 @@ class MPPISolver:
                 # Force the first sample to be the current mean (Zero noise)
                 candidates[:, 0] = batch_mean
 
-                costs = self.model.get_cost(expanded_infos, candidates)
+                costs = self.cost.get_cost(expanded_infos, candidates)
 
                 assert isinstance(costs, torch.Tensor), (
                     f'Expected cost to be a torch.Tensor, got {type(costs)}'

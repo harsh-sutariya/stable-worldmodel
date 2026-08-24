@@ -12,12 +12,12 @@ Stable World-Model is an open-source library to conduct world model research.  Y
 === "uv"
 
         :::bash
-        uv add stable-worldmodel
+        uv add 'stable-worldmodel[data]'
 
 === "pip"
 
         :::bash
-        pip install stable-worldmodel
+        pip install 'stable-worldmodel[data]'
 
 === "uv (all dependencies)"
 
@@ -32,6 +32,9 @@ Stable World-Model is an open-source library to conduct world model research.  Y
 
 !!! note ""
     ⚠️ The base installation does not include environment (`env`) or training (`train`) dependencies. Install them separately or use the "all dependencies" option above if you need to run simulations or train models.
+
+!!! note ""
+    The `data` extra shown above adds the Lance stack (`lancedb`, `pylance`, `pyarrow`) behind the default dataset format, and is what most users want. A bare `pip install stable-worldmodel` gives you the solvers, world models, and environments but no dataset reading or writing — useful when embedding `stable_worldmodel.planning` somewhere that cannot afford ~410 MB of native wheels.
 
 A **world model** is a learned simulator that predicts how an environment evolves in response to actions, enabling agents to plan by imagining future outcomes. Stable World-Model provides a unified research ecosystem that simplifies the entire pipeline: from data collection to model training and evaluation.
 
@@ -63,7 +66,7 @@ Here is a quick start example: collect a dataset and perform an evaluation.
 import stable_worldmodel as swm
 from stable_worldmodel.data import HDF5Dataset
 from stable_worldmodel.policy import WorldModelPolicy, PlanConfig
-from stable_worldmodel.solver import CEMSolver
+from stable_worldmodel.planning import CEMSolver
 
 
 world = swm.World('swm/PushT-v1', num_envs=8, image_shape=(64, 64))
@@ -88,7 +91,7 @@ dataset = HDF5Dataset(
 )
 
 # model predictive control
-solver = CEMSolver(model=world_model, num_samples=300, device='cuda')
+solver = CEMSolver(cost=world_model, num_samples=300, device='cuda')
 policy = WorldModelPolicy(
     solver=solver,
     config=PlanConfig(horizon=10, receding_horizon=5)

@@ -247,6 +247,7 @@ def _run_post_training(cfg, model, pl_logger):
             },
             'seed':        eval_cfg_raw['seed'],
             'policy':      f"{cfg.output_model_name}/weights_epoch_{cfg.trainer.max_epochs:04d}.pt",
+            'objective':   eval_cfg_raw['objective'],
             'solver':      eval_cfg_raw['solver'],
             'plan_config': eval_cfg_raw['plan_config'],
             'dataset':     {'keys_to_cache': eval_cfg_raw['keys_to_cache']},

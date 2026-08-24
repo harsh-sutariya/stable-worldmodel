@@ -56,7 +56,30 @@ class Dataset:
 
     @property
     def column_names(self) -> list[str]:
+        """Names of the columns stored in the dataset."""
         raise NotImplementedError
+
+    @property
+    def episode_column_names(self) -> list[str]:
+        """Names of episode-scoped columns (one value per episode, not per
+        step). Empty for datasets without episode-scoped data."""
+        return []
+
+    def get_episode_data(
+        self, episodes_idx: np.ndarray | list[int] | None = None
+    ) -> dict[str, list]:
+        """Episode-scoped values for the requested episodes.
+
+        Args:
+            episodes_idx: Episode indices, in any order and with duplicates
+                allowed. ``None`` selects all episodes.
+
+        Returns:
+            ``{name: [value, ...]}`` with one entry per requested episode,
+            in request order. Empty when the dataset has no episode-scoped
+            data.
+        """
+        return {}
 
     def _load_slice(self, ep_idx: int, start: int, end: int) -> dict:
         raise NotImplementedError
@@ -65,6 +88,15 @@ class Dataset:
         return len(self.clip_indices)
 
     def __getitem__(self, idx: int) -> dict:
+        """Load one clip of ``num_steps`` observations (``frameskip`` apart).
+
+        Args:
+            idx: Clip index into ``clip_indices``.
+
+        Returns:
+            Dict of per-column tensors for the clip; ``action`` is reshaped
+            to ``(num_steps, -1)`` so skipped actions stay grouped per step.
+        """
         ep_idx, start = self.clip_indices[idx]
         steps = self._load_slice(ep_idx, start, start + self.span)
         if 'action' in steps:
@@ -74,6 +106,17 @@ class Dataset:
     def load_chunk(
         self, episodes_idx: np.ndarray, start: np.ndarray, end: np.ndarray
     ) -> list[dict]:
+        """Load one step-range per episode, in bulk.
+
+        Args:
+            episodes_idx: Episode index for each slice to load.
+            start: Start step (inclusive) of each slice, per episode.
+            end: End step (exclusive) of each slice, per episode.
+
+        Returns:
+            One dict of per-column tensors per requested slice, in order;
+            ``action`` is reshaped to ``((end - start) // frameskip, -1)``.
+        """
         chunk = []
         for ep, s, e in zip(episodes_idx, start, end):
             steps = self._load_slice(ep, s, e)
@@ -85,15 +128,26 @@ class Dataset:
         return chunk
 
     def load_episode(self, episode_idx: int) -> dict:
+        """Load a full episode as a dict of per-column tensors.
+
+        Args:
+            episode_idx: Index of the episode to load.
+
+        Returns:
+            Dict of per-column tensors covering every step of the episode.
+        """
         return self._load_slice(episode_idx, 0, self.lengths[episode_idx])
 
     def get_col_data(self, col: str) -> np.ndarray:
+        """Return every value of column ``col`` across the whole dataset."""
         raise NotImplementedError
 
     def get_dim(self, col: str) -> int:
+        """Return the per-step dimensionality of column ``col``."""
         raise NotImplementedError
 
     def get_row_data(self, row_idx: int | list[int]) -> dict:
+        """Return all columns for the given flat storage row(s)."""
         raise NotImplementedError
 
     def merge_col(
@@ -102,6 +156,13 @@ class Dataset:
         target: str,
         dim: int = -1,
     ) -> None:
+        """Concatenate ``source`` column(s) into a new ``target`` column.
+
+        Args:
+            source: Column name(s) to combine.
+            target: Name of the resulting column.
+            dim: Axis along which the source columns are concatenated.
+        """
         raise NotImplementedError
 
 
@@ -136,13 +197,41 @@ class MergeDataset:
 
     @property
     def column_names(self) -> list[str]:
+        """Union of the columns contributed by each dataset, in order."""
         cols = []
         for keys in self.keys_map:
             cols.extend(keys)
         return cols
 
     @property
+    def episode_column_names(self) -> list[str]:
+        seen: set[str] = set()
+        cols = []
+        for ds in self.datasets:
+            for c in getattr(ds, 'episode_column_names', []):
+                if c not in seen:
+                    seen.add(c)
+                    cols.append(c)
+        return cols
+
+    def get_episode_data(
+        self, episodes_idx: np.ndarray | list[int] | None = None
+    ) -> dict[str, list]:
+        """Union of the sub-datasets' episode data; on a name collision the
+        first dataset wins (mirrors the per-step column policy)."""
+        out: dict[str, list] = {}
+        for ds in self.datasets:
+            getter = getattr(ds, 'get_episode_data', None)
+            if getter is None:
+                continue
+            for k, v in getter(episodes_idx).items():
+                if k not in out:
+                    out[k] = v
+        return out
+
+    @property
     def lengths(self) -> np.ndarray:
+        """Episode lengths, taken from the first dataset."""
         return self.datasets[0].lengths
 
     def __len__(self) -> int:
@@ -160,6 +249,7 @@ class MergeDataset:
     def load_chunk(
         self, episodes_idx: np.ndarray, start: np.ndarray, end: np.ndarray
     ) -> list[dict]:
+        """Load slices from every dataset and merge them column-wise."""
         all_chunks = [
             ds.load_chunk(episodes_idx, start, end) for ds in self.datasets
         ]
@@ -172,12 +262,14 @@ class MergeDataset:
         return merged
 
     def get_col_data(self, col: str) -> np.ndarray:
+        """Return column ``col`` from the dataset that contributes it."""
         for ds, keys in zip(self.datasets, self.keys_map):
             if col in keys:
                 return ds.get_col_data(col)
         raise KeyError(col)
 
     def get_row_data(self, row_idx: int | list[int]) -> dict:
+        """Return the given row(s) with columns gathered from all datasets."""
         out = {}
         for ds, keys in zip(self.datasets, self.keys_map):
             data = ds.get_row_data(row_idx)
@@ -188,7 +280,12 @@ class MergeDataset:
 
 
 class ConcatDataset:
-    """Concatenate datasets sequentially (vertical join, more episodes)."""
+    """Concatenate datasets sequentially (vertical join, more episodes).
+
+    Args:
+        datasets: Datasets to concatenate, in order. Episode and clip
+            indices of later datasets are shifted past the earlier ones.
+    """
 
     def __init__(self, datasets: list[Any]) -> None:
         if not datasets:
@@ -203,6 +300,7 @@ class ConcatDataset:
 
     @property
     def column_names(self) -> list[str]:
+        """Union of all datasets' columns, first occurrence order."""
         seen = set()
         cols = []
         for ds in self.datasets:
@@ -211,6 +309,48 @@ class ConcatDataset:
                     seen.add(c)
                     cols.append(c)
         return cols
+
+    @property
+    def episode_column_names(self) -> list[str]:
+        seen: set[str] = set()
+        cols = []
+        for ds in self.datasets:
+            for c in getattr(ds, 'episode_column_names', []):
+                if c not in seen:
+                    seen.add(c)
+                    cols.append(c)
+        return cols
+
+    def get_episode_data(
+        self, episodes_idx: np.ndarray | list[int] | None = None
+    ) -> dict[str, list]:
+        """Episode data gathered across sub-datasets, mapped through the
+        global→local episode index. Episodes from sub-datasets missing a
+        key are filled with ``None``."""
+        cols = self.episode_column_names
+        if not cols:
+            return {}
+        if episodes_idx is None:
+            episodes_idx = np.arange(int(self._ep_cum[-1]))
+        episodes_idx = np.asarray(episodes_idx, dtype=np.int64).reshape(-1)
+
+        ds_indices = np.searchsorted(
+            self._ep_cum[1:], episodes_idx, side='right'
+        )
+        local_eps = episodes_idx - self._ep_cum[ds_indices]
+
+        out: dict[str, list] = {k: [None] * len(episodes_idx) for k in cols}
+        for ds_idx in range(len(self.datasets)):
+            mask = ds_indices == ds_idx
+            if not np.any(mask):
+                continue
+            getter = getattr(self.datasets[ds_idx], 'get_episode_data', None)
+            data = getter(local_eps[mask]) if getter is not None else {}
+            positions = np.where(mask)[0]
+            for k, vals in data.items():
+                for pos, v in zip(positions, vals):
+                    out[k][int(pos)] = v
+        return out
 
     def __len__(self) -> int:
         return self._cum[-1]
@@ -253,6 +393,7 @@ class ConcatDataset:
     def load_chunk(
         self, episodes_idx: np.ndarray, start: np.ndarray, end: np.ndarray
     ) -> list[dict]:
+        """Route each slice to its dataset using global episode indices."""
         episodes_idx = np.asarray(episodes_idx)
         start = np.asarray(start)
         end = np.asarray(end)
@@ -276,6 +417,7 @@ class ConcatDataset:
         return results  # type: ignore[return-value]
 
     def get_col_data(self, col: str) -> np.ndarray:
+        """Concatenate column ``col`` from every dataset that has it."""
         data = []
         for ds in self.datasets:
             if col in ds.column_names:
@@ -285,6 +427,7 @@ class ConcatDataset:
         return np.concatenate(data)
 
     def get_row_data(self, row_idx: int | list[int]) -> dict:
+        """Return the given global row(s), stacked when a list is given."""
         if isinstance(row_idx, int):
             ds_idx, local_idx = self._loc(row_idx)
             return self.datasets[ds_idx].get_row_data(local_idx)
@@ -310,6 +453,19 @@ class GoalDataset:
       - uniform future state in same episode
       - current state
     with probabilities (0.3, 0.5, 0.0, 0.2) by default.
+
+    Args:
+        dataset: The dataset to wrap.
+        goal_probabilities: 4-tuple of probabilities (random,
+            geometric_future, uniform_future, current); must sum to 1.
+        gamma: Discount for the geometric future sampler; the future offset
+            is drawn from ``Geom(1 - gamma)``.
+        current_goal_offset: Step offset (in clip steps) defining the
+            "current" state used as goal. Defaults to ``dataset.num_steps``.
+        goal_keys: Mapping of source column to goal column (e.g.
+            ``{'pixels': 'goal_pixels'}``). Defaults to ``pixels`` and
+            ``proprio`` when present in the dataset.
+        seed: Seed for the goal-sampling RNG.
     """
 
     def __init__(
@@ -382,6 +538,7 @@ class GoalDataset:
 
     @property
     def clip_indices(self):
+        """Clip indices, filtered to clips that still have a future frame."""
         return self._clip_indices
 
     def __len__(self):
@@ -389,7 +546,18 @@ class GoalDataset:
 
     @property
     def column_names(self):
+        """Columns of the wrapped dataset (goal columns are added per item)."""
         return self.dataset.column_names
+
+    @property
+    def episode_column_names(self) -> list[str]:
+        return getattr(self.dataset, 'episode_column_names', [])
+
+    def get_episode_data(
+        self, episodes_idx: np.ndarray | list[int] | None = None
+    ) -> dict[str, list]:
+        getter = getattr(self.dataset, 'get_episode_data', None)
+        return getter(episodes_idx) if getter is not None else {}
 
     def _sample_goal_kind(self) -> str:
         r = self.rng.random()

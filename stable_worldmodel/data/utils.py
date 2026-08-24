@@ -1,14 +1,30 @@
+from __future__ import annotations
+
 import json
+import logging
 import os
 import urllib.request
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
-from loguru import logger as logging
 from tqdm import tqdm
 
 from stable_worldmodel.utils import DEFAULT_CACHE_DIR, HF_BASE_URL
+
+if TYPE_CHECKING:
+    from stable_pretraining.data.transforms import WrapTorchTransform
+
+    from stable_worldmodel.data.dataset import Dataset
+
+
+if TYPE_CHECKING:
+    from stable_pretraining.data.transforms import WrapTorchTransform
+
+    from stable_worldmodel.data.dataset import Dataset
+
+logger = logging.getLogger(__name__)
 
 
 def get_cache_dir(
@@ -36,8 +52,8 @@ def load_dataset(
     name: str,
     cache_dir: str = None,
     format: str | None = None,
-    **kwargs,
-):
+    **kwargs: Any,
+) -> Dataset:
     """Resolve a dataset name to a local path and dispatch to the matching
     format reader from the registry.
 
@@ -59,7 +75,7 @@ def load_dataset(
         cache_dir: Root cache directory. Defaults to ``STABLEWM_HOME`` or
             ``~/.stable_worldmodel``.
         format: Explicit format name (skips detection).
-        **kwargs: Forwarded to the format's reader.
+        **kwargs (Any): Forwarded to the format's reader.
 
     Returns:
         A reader instance (typically a
@@ -187,10 +203,10 @@ def _resolve_dataset_hf(repo_id: str, datasets_dir: Path) -> Path:
     local_dir = datasets_dir / repo_id.replace('/', '--')
 
     if local_dir.is_dir() and any(local_dir.iterdir()):
-        logging.info(f'Using cached dataset for {repo_id} at {local_dir}')
+        logger.info(f'Using cached dataset for {repo_id} at {local_dir}')
         return local_dir
 
-    logging.info(f'Downloading dataset {repo_id} from HuggingFace...')
+    logger.info(f'Downloading dataset {repo_id} from HuggingFace...')
     local_dir.mkdir(parents=True, exist_ok=True)
 
     entry = _hf_find_dataset_entry(repo_id)
@@ -211,7 +227,7 @@ def _resolve_dataset_hf(repo_id: str, datasets_dir: Path) -> Path:
         url = f'{HF_BASE_URL}/datasets/{repo_id}/resolve/main/{entry_path}'
         dest = local_dir / entry_path
         dest.parent.mkdir(parents=True, exist_ok=True)
-        logging.info(f'Fetching {url}')
+        logger.info(f'Fetching {url}')
         _download(url, dest)
 
     return local_dir
@@ -233,40 +249,53 @@ def _download(url: str, dest: Path) -> None:
 
 
 def convert(
-    source,
-    dest,
+    source: str | Path,
+    dest: str | Path,
     *,
     source_format: str | None = None,
     dest_format: str = 'lance',
     cache_dir: str | None = None,
     progress: bool = True,
-    **dest_kwargs,
+    **dest_kwargs: Any,
 ) -> None:
     """Convert a dataset from one registered format to another.
 
     Reads each episode from *source* and writes it through the writer of
     *dest_format*. Format detection follows the same rules as
     :func:`load_dataset` — autodetect by default, or pass ``source_format``
-    explicitly.
+    explicitly. Episode-scoped data is carried through when the destination
+    format supports it (``Format.supports_episode_data``) and dropped with
+    a warning otherwise.
 
     Args:
-        source: Path or identifier accepted by :func:`load_dataset`.
-        dest: Output path for the destination writer.
+        source (str | Path): Path or identifier accepted by :func:`load_dataset`.
+        dest (str | Path): Output path for the destination writer.
         source_format: Force a source format (skips detection).
         dest_format: Registered writer name (default ``'lance'``).
         cache_dir: Forwarded to the source loader for HF/local resolution.
         progress: Show a progress bar over episodes.
-        **dest_kwargs: Forwarded to the destination writer.
+        **dest_kwargs (Any): Forwarded to the destination writer.
 
     Example::
 
         from stable_worldmodel.data import convert
         convert('data.lance', 'data_video', dest_format='video')
     """
-    from stable_worldmodel.data.format import get_format
+    from stable_worldmodel.data.format import EPISODE_DATA_KEY, get_format
 
     src = load_dataset(source, cache_dir=cache_dir, format=source_format)
     writer_cls = get_format(dest_format)
+
+    ep_cols = list(getattr(src, 'episode_column_names', None) or [])
+    carry_episode_data = bool(ep_cols)
+    if carry_episode_data and not getattr(
+        writer_cls, 'supports_episode_data', False
+    ):
+        logger.warning(
+            f"convert: destination format '{dest_format}' does not support "
+            f'episode data; dropping episode columns {ep_cols}.'
+        )
+        carry_episode_data = False
 
     iterator = range(len(src.lengths))
     if progress:
@@ -275,9 +304,128 @@ def convert(
     def episodes():
         for ep_idx in iterator:
             ep = src.load_episode(ep_idx)
-            yield _episode_to_step_lists(ep, int(src.lengths[ep_idx]))
+            step_ep = _episode_to_step_lists(ep, int(src.lengths[ep_idx]))
+            if carry_episode_data:
+                extra = src.get_episode_data([ep_idx])
+                step_ep[EPISODE_DATA_KEY] = {k: v[0] for k, v in extra.items()}
+            yield step_ep
 
     with writer_cls.open_writer(dest, **dest_kwargs) as writer:
+        writer.write_episodes(episodes())
+
+
+def merge(
+    sources,
+    dest,
+    *,
+    dest_format: str = 'lance',
+    source_formats: list[str | None] | None = None,
+    mode: str = 'error',
+    cache_dir: str | None = None,
+    progress: bool = True,
+    **dest_kwargs,
+) -> None:
+    """Concatenate several datasets into a single dataset.
+
+    Episodes are read from each source in order and streamed through one
+    destination writer. The writer assigns contiguous episode indices across
+    all sources, so shards written independently (each starting at episode 0)
+    are renumbered into a single ``0..N-1`` range automatically — a source's
+    own ``episode_idx`` is stripped by the reader and never carried through.
+
+    Schema compatibility across sources is enforced by the writer: the first
+    episode fixes the schema and any later episode with different columns or
+    dimensions raises a clear error before more data is written.
+
+    Args:
+        sources: Two or more paths/identifiers accepted by :func:`load_dataset`.
+            Merged in the order given.
+        dest: Output path for the destination writer.
+        dest_format: Registered writer name (default ``'lance'``).
+        source_formats: Optional per-source format overrides (skips detection);
+            must align with ``sources`` when provided.
+        mode: Write mode for the destination — ``'error'`` (default) refuses to
+            touch an existing dataset, ``'overwrite'`` starts fresh,
+            ``'append'`` extends an existing one.
+        cache_dir: Forwarded to the source loader for HF/local resolution.
+        progress: Show a per-source progress bar over episodes.
+        **dest_kwargs: Forwarded to the destination writer.
+
+    Example::
+
+        from stable_worldmodel.data import merge
+        merge(['shard0', 'shard1', 'shard2'], 'combined', dest_format='lance')
+    """
+    from stable_worldmodel.data.format import EPISODE_DATA_KEY, get_format
+
+    sources = list(sources)
+    if len(sources) < 2:
+        raise ValueError('merge needs at least two source datasets')
+    if source_formats is not None and len(source_formats) != len(sources):
+        raise ValueError('source_formats must align with sources')
+
+    writer_cls = get_format(dest_format)
+
+    def _fmt(i):
+        return source_formats[i] if source_formats else None
+
+    # Pre-flight column check. Within a single writer session the schema is
+    # fixed by the first episode and a later mismatch surfaces only as an
+    # opaque Arrow key error, so compare column sets (per-step and
+    # episode-scoped) up front to fail fast with an actionable message
+    # before any data is written.
+    reference = None
+    ep_reference: set[str] = set()
+    for i, source in enumerate(sources):
+        ds = load_dataset(source, cache_dir=cache_dir, format=_fmt(i))
+        cols = set(ds.column_names)
+        ep_cols = set(getattr(ds, 'episode_column_names', None) or [])
+        if reference is None:
+            reference, ep_reference, ref_source = cols, ep_cols, source
+            continue
+        if cols != reference:
+            missing = sorted(reference - cols)
+            extra = sorted(cols - reference)
+            raise ValueError(
+                f'merge: column mismatch between {ref_source!r} and {source!r}: '
+                f'missing {missing}; unexpected {extra}. '
+                'All sources must share the same columns.'
+            )
+        if ep_cols != ep_reference:
+            raise ValueError(
+                f'merge: episode-data column mismatch between {ref_source!r} '
+                f'and {source!r}: missing {sorted(ep_reference - ep_cols)}; '
+                f'unexpected {sorted(ep_cols - ep_reference)}. '
+                'All sources must share the same episode-data columns.'
+            )
+
+    carry_episode_data = bool(ep_reference)
+    if carry_episode_data and not getattr(
+        writer_cls, 'supports_episode_data', False
+    ):
+        logger.warning(
+            f"merge: destination format '{dest_format}' does not support "
+            f'episode data; dropping episode columns {sorted(ep_reference)}.'
+        )
+        carry_episode_data = False
+
+    def episodes():
+        for i, source in enumerate(sources):
+            src = load_dataset(source, cache_dir=cache_dir, format=_fmt(i))
+            iterator = range(len(src.lengths))
+            if progress:
+                iterator = tqdm(iterator, desc=f'Merging {source}')
+            for ep_idx in iterator:
+                ep = src.load_episode(ep_idx)
+                step_ep = _episode_to_step_lists(ep, int(src.lengths[ep_idx]))
+                if carry_episode_data:
+                    extra = src.get_episode_data([ep_idx])
+                    step_ep[EPISODE_DATA_KEY] = {
+                        k: v[0] for k, v in extra.items()
+                    }
+                yield step_ep
+
+    with writer_cls.open_writer(dest, mode=mode, **dest_kwargs) as writer:
         writer.write_episodes(episodes())
 
 
@@ -331,12 +479,13 @@ from stable_worldmodel.data.normalization import (  # noqa: E402
 
 
 def column_normalizer(
-    dataset, source: str, target: str, method: str = 'zscore'
-):
+    dataset: Dataset, source: str, target: str, method: str = 'zscore'
+) -> WrapTorchTransform:
     """Build a per-column normalizer :class:`WrapTorchTransform` from dataset stats.
 
     Args:
-        dataset: A dataset exposing ``get_col_data(col)`` returning an array.
+        dataset (Dataset): A dataset exposing ``get_col_data(col)`` returning
+            an array.
         source: Column name to read.
         target: Column name to write.
         method: One of ``'zscore'`` (default), ``'percentile'``, or ``'none'``.
@@ -359,6 +508,7 @@ def column_normalizer(
 __all__ = [
     'load_dataset',
     'convert',
+    'merge',
     'get_cache_dir',
     'ensure_dir_exists',
     'IdentityScaler',

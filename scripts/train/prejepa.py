@@ -1,21 +1,36 @@
+import logging
 import os
-from functools import partial
+from pathlib import Path
 
 import hydra
 import lightning as pl
 import stable_pretraining as spt
 import stable_worldmodel as swm
 import torch
-from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
-from loguru import logger as logging
+from lightning.pytorch.callbacks import Callback
+from functools import partial
+from stable_worldmodel.data import column_normalizer as get_column_normalizer
+from stable_worldmodel.wm.utils import save_pretrained
+from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from transformers import AutoVideoProcessor
 
-from stable_worldmodel.data import column_normalizer as get_column_normalizer
 
-from utils import SaveCkptCallback, build_wandb_logger, get_img_preprocessor, setup_run_dir
+# ---------------------------------------------------------------------------
+# Data helpers
+# ---------------------------------------------------------------------------
+
+logger = logging.getLogger(__name__)
+
+
+def get_img_preprocessor(source, target, img_size=224):
+    stats = spt.data.dataset_stats.ImageNet
+    return spt.data.transforms.Compose(
+        spt.data.transforms.ToImage(**stats, source=source, target=target),
+        spt.data.transforms.Resize(img_size, source=source, target=target),
+    )
 
 
 class VideoPipeline(spt.data.transforms.Transform):
@@ -35,7 +50,45 @@ class VideoPipeline(spt.data.transforms.Transform):
         return x
 
 
+# ---------------------------------------------------------------------------
+# Callbacks
+# ---------------------------------------------------------------------------
+
+
+class SaveCkptCallback(Callback):
+    """Callback to save model checkpoint after each epoch using save_pretrained."""
+
+    def __init__(self, run_name, cfg, epoch_interval=1):
+        super().__init__()
+        self.run_name = run_name
+        self.cfg = cfg
+        self.epoch_interval = epoch_interval
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if not trainer.is_global_zero:
+            return
+        epoch = trainer.current_epoch + 1
+        if epoch % self.epoch_interval == 0:
+            self._save(pl_module.model, epoch)
+        if epoch == trainer.max_epochs:
+            self._save(pl_module.model, epoch)
+
+    def _save(self, model, epoch):
+        save_pretrained(
+            model,
+            run_name=self.run_name,
+            config=self.cfg,
+            filename=f'weights_epoch_{epoch}.pt',
+        )
+
+
+# ---------------------------------------------------------------------------
+# Forward
+# ---------------------------------------------------------------------------
+
+
 def _strip_action_dims(tensor, action_range):
+    """Remove the action dimensions from the last axis."""
     return torch.cat(
         [tensor[..., : action_range[0]], tensor[..., action_range[1] :]],
         dim=-1,
@@ -57,6 +110,7 @@ def dinowm_forward(self, batch, stage, cfg):
     pred_embedding = self.model.predict(embedding)
     target_embedding = batch['emb'][:, cfg.wm.num_preds :, ...].detach()
 
+    # Per-modality losses
     pixels_dim = batch['pixels_emb'].size(-1)
     batch['pixels_loss'] = F.mse_loss(
         pred_embedding[..., :pixels_dim], target_embedding[..., :pixels_dim]
@@ -75,10 +129,15 @@ def dinowm_forward(self, batch, stage, cfg):
             )
         start = hi
 
+    # Actionless embeddings (for probes and total loss)
     batch['actionless_emb'] = _strip_action_dims(batch['emb'], action_range)
     batch['actionless_prev_emb'] = _strip_action_dims(embedding, action_range)
-    batch['actionless_pred_emb'] = _strip_action_dims(pred_embedding, action_range)
-    batch['actionless_target_emb'] = _strip_action_dims(target_embedding, action_range)
+    batch['actionless_pred_emb'] = _strip_action_dims(
+        pred_embedding, action_range
+    )
+    batch['actionless_target_emb'] = _strip_action_dims(
+        target_embedding, action_range
+    )
 
     batch['loss'] = F.mse_loss(
         batch['actionless_pred_emb'],
@@ -96,6 +155,11 @@ def dinowm_forward(self, batch, stage, cfg):
     return batch
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
 @hydra.main(version_base=None, config_path='./config', config_name='prejepa')
 def run(cfg):
     # --- Dataset ---
@@ -103,9 +167,8 @@ def run(cfg):
     keys_to_load = ['pixels'] + encoding_keys
 
     cache_dir = os.environ.get('LOCAL_DATASET_DIR', None)
-    logging.info(
-        f'Loading dataset "{cfg.dataset_name}" from '
-        f'{"local cache: " + cache_dir if cache_dir else "default location"}'
+    print(
+        f'Loading dataset "{cfg.dataset_name}" from {"local cache: " + cache_dir if cache_dir else "default location"}'
     )
     dataset = swm.data.load_dataset(
         cfg.dataset_name,
@@ -146,7 +209,9 @@ def run(cfg):
                     f"Encoding key '{key}' not found in dataset columns."
                 )
             dim = dataset.get_dim(key)
-            cfg.extra_dims[key] = dim if key != 'action' else dim * cfg.frameskip
+            cfg.extra_dims[key] = (
+                dim if key != 'action' else dim * cfg.frameskip
+            )
 
     rnd_gen = torch.Generator().manual_seed(cfg.seed)
     train_set, val_set = spt.data.random_split(
@@ -177,7 +242,9 @@ def run(cfg):
 
     is_cnn = hasattr(encoder.config, 'hidden_sizes')
     embed_dim = (
-        encoder.config.hidden_sizes[-1] if is_cnn else encoder.config.hidden_size
+        encoder.config.hidden_sizes[-1]
+        if is_cnn
+        else encoder.config.hidden_size
     )
     num_patches = 1 if is_cnn else (cfg.image_size // cfg.patch_size) ** 2
     embed_dim += sum(cfg.wm.get('encoding', {}).values())
@@ -201,6 +268,7 @@ def run(cfg):
         }
 
     world_model = hydra.utils.instantiate(cfg.model, encoder=encoder)
+
     world_model = spt.Module(
         model=world_model,
         forward=partial(dinowm_forward, cfg=cfg),
@@ -210,44 +278,49 @@ def run(cfg):
     )
 
     # --- Training ---
-    run_dir = setup_run_dir(cfg)
-    pl_logger = build_wandb_logger(cfg)
+    run_id = cfg.get('subdir') or ''
+    run_dir = Path(
+        swm.data.utils.get_cache_dir(sub_folder='checkpoints'), run_id
+    )
+    run_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f'Run ID: {run_id}')
 
-    last_ckpt = run_dir / 'lightning' / 'last.ckpt'
+    with open(run_dir / 'config.yaml', 'w') as f:
+        OmegaConf.save(cfg, f)
 
-    callbacks = [
-        ModelCheckpoint(
-            dirpath=run_dir / 'lightning',
-            filename='epoch={epoch:04d}',
-            monitor='validate/loss',
-            save_top_k=cfg.checkpointing.save_top_k,
-            save_last=cfg.checkpointing.save_last,
-            mode='min',
-            verbose=True,
-        ),
-        LearningRateMonitor(logging_interval='step'),
-        SaveCkptCallback(
-            run_name=cfg.output_model_name,
-            cfg=cfg,
-            every_n_epochs=cfg.checkpointing.every_n_epochs,
-        ),
-        spt.callbacks.CPUOffloadCallback(),
-    ]
+    logger = None
+    if cfg.wandb.enabled:
+        logger = WandbLogger(**cfg.wandb.config)
+        logger.log_hyperparams(OmegaConf.to_container(cfg))
 
     trainer = pl.Trainer(
         **cfg.trainer,
-        callbacks=callbacks,
+        callbacks=[
+            SaveCkptCallback(
+                run_name=cfg.output_model_name,
+                cfg=cfg.model,
+                epoch_interval=5,
+            ),
+            pl.pytorch.callbacks.LearningRateMonitor(logging_interval='step'),
+        ],
         num_sanity_val_steps=1,
-        logger=pl_logger,
+        logger=logger,
+        enable_checkpointing=True,
     )
 
-    spt.Manager(
+    ckpt_path = run_dir / f'{cfg.output_model_name}_weights.ckpt'
+    manager = spt.Manager(
         trainer=trainer,
         module=world_model,
         data=spt.data.DataModule(train=train_loader, val=val_loader),
-        ckpt_path=last_ckpt if last_ckpt.exists() else None,
-    )()
+        ckpt_path=ckpt_path if ckpt_path.exists() else None,
+    )
+    manager()
 
 
 if __name__ == '__main__':
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(levelname)s | %(name)s | %(message)s',
+    )
     run()

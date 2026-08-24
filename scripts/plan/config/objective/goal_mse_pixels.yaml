@@ -1,0 +1,11 @@
+# Goal MSE for a split latent whose only non-action source is pixels
+# (PreJEPA / dinowm_noprop-pusht). See goal_mse_pixels_proprio.yaml for why
+# the fused latent is not scored directly; `reduction: mean` reproduces the
+# former PreJEPA.criterion exactly.
+_target_: stable_worldmodel.planning.WeightedSum
+terms:
+  - - 1.0
+    - _target_: stable_worldmodel.planning.GoalMSE
+      pred_key: predicted_pixels_emb
+      goal_key: pixels_goal_emb
+      reduction: mean

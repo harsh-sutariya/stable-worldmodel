@@ -1,6 +1,7 @@
 defaults:
   - launcher: local
   - solver: cem
+  - objective: goal_mse
   - _self_
 
 world:
@@ -14,6 +15,7 @@ plan_config:
   horizon: 1
   receding_horizon: 1
   action_block: 5  # frameskip
+  # history_len: 3  # context frames fed to the world model; match training history_size
 
 dataset:
   stats: ${eval.dataset_name}
