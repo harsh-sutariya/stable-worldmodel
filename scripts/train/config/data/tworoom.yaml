@@ -15,6 +15,7 @@ data:
       - proprio
 
 # Paper (Appendix D): TwoRoom-specific model and training overrides
+img_size: 56
 wm:
   history_size: 1
 

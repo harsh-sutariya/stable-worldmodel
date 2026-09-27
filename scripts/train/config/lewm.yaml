@@ -2,7 +2,7 @@ defaults:
   - _self_
   - launcher: local
   - data: pusht
-  - logger: wandb
+  - logger: aim
 
 hydra:
   job:
