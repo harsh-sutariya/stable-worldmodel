@@ -1,0 +1,5 @@
+_target_: lightning.pytorch.loggers.WandbLogger
+project: stable-wm
+entity: null         # set to your W&B entity/username
+name: ${output_model_name}
+log_model: false

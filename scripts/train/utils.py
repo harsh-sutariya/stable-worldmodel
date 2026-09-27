@@ -48,22 +48,45 @@ def setup_run_dir(cfg) -> Path:
     return run_dir
 
 
-def build_wandb_logger(cfg, run_dir: Path | None = None):
-    """Return a WandbLogger if wandb.enabled is true, otherwise None.
+def log_metrics(pl_logger, metrics: dict, step: int | None = None):
+    """Log a dict of scalar metrics to whatever PL logger is active; no-op if None."""
+    if pl_logger is None:
+        return
+    pl_logger.log_metrics(metrics, step=step)
 
-    If run_dir is provided, the W&B run ID is persisted to
-    <run_dir>/wandb_run_id.txt so that resuming training always
-    continues the exact same W&B run (rather than starting a new one).
-    Delete that file to force a fresh W&B run.
+
+def build_logger(cfg, run_dir: Path | None = None):
+    """Instantiate and return a Lightning logger from cfg.logger, or None.
+
+    Swap the backend at the CLI with logger=aim / logger=none.
+    W&B run IDs are persisted under <run_dir>/wandb_run_id.txt so resuming
+    training always continues the same W&B run (delete that file to force a
+    fresh run).
     """
+    logger_cfg = cfg.get('logger')
+    if not logger_cfg or OmegaConf.is_missing(logger_cfg, '_target_'):
+        return None
+
+    target = logger_cfg.get('_target_')
+    if target is None:
+        return None
+
+    if 'WandbLogger' in str(target):
+        return _build_wandb_logger(cfg, run_dir)
+
+    import hydra
+    pl_logger = hydra.utils.instantiate(logger_cfg)
+    pl_logger.log_hyperparams(OmegaConf.to_container(cfg, resolve=True))
+    pl_logger.log_hyperparams(_git_info())
+    return pl_logger
+
+
+def _build_wandb_logger(cfg, run_dir: Path | None = None):
     import wandb as _wandb
     from lightning.pytorch.loggers import WandbLogger
 
-    if not cfg.wandb.enabled:
-        return None
-
-    kwargs = OmegaConf.to_container(cfg.wandb, resolve=True)
-    kwargs.pop('enabled')
+    kwargs = OmegaConf.to_container(cfg.logger, resolve=True)
+    kwargs.pop('_target_')
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
     if run_dir is not None:
@@ -94,7 +117,7 @@ class SaveCkptCallback(Callback):
     load_pretrained / AutoCostModel / AutoActionableModel can read.
 
     If probe_cfg is provided, linear probing is run after each checkpoint
-    save and R² curves are logged to W&B (same global_step x-axis as loss).
+    save and R² curves are logged (same global_step x-axis as loss).
     """
 
     def __init__(
@@ -104,6 +127,7 @@ class SaveCkptCallback(Callback):
         every_n_epochs: int = 5,
         probe_cfg: dict | None = None,
         device: str = 'cpu',
+        pl_logger=None,
     ):
         super().__init__()
         self.run_name = run_name
@@ -111,6 +135,7 @@ class SaveCkptCallback(Callback):
         self.every_n_epochs = every_n_epochs
         self.probe_cfg = probe_cfg
         self.device = device
+        self.pl_logger = pl_logger
 
     def on_train_epoch_end(self, trainer, pl_module):
         if not trainer.is_global_zero:
@@ -128,7 +153,6 @@ class SaveCkptCallback(Callback):
                 self._run_probe(pl_module.model, trainer.global_step)
 
     def _run_probe(self, model, global_step: int):
-        import wandb
         from probe import probe_model
 
         logging.info(f'Running linear probe at step {global_step}...')
@@ -139,6 +163,5 @@ class SaveCkptCallback(Callback):
             for target, v in targets.items():
                 metrics[f'probe/{level}/{target}'] = v['mean']
 
-        if wandb.run is not None:
-            wandb.log(metrics, step=global_step)
-            logging.info(f'Probe metrics logged to W&B ({len(metrics)} keys)')
+        log_metrics(self.pl_logger, metrics, step=global_step)
+        logging.info(f'Probe metrics logged ({len(metrics)} keys)')

@@ -17,7 +17,7 @@ from omegaconf import OmegaConf, open_dict
 from stable_worldmodel.data import column_normalizer as get_column_normalizer
 from stable_worldmodel.wm.loss import SIGReg
 
-from utils import SaveCkptCallback, build_wandb_logger, get_img_preprocessor, setup_run_dir
+from utils import SaveCkptCallback, build_logger, get_img_preprocessor, log_metrics, setup_run_dir
 
 # Make scripts/plan importable for eval_model
 sys.path.insert(0, str(Path(__file__).parent.parent / 'plan'))
@@ -162,7 +162,7 @@ def run(cfg):
     ##########################
 
     run_dir = setup_run_dir(cfg)
-    pl_logger = build_wandb_logger(cfg, run_dir)
+    pl_logger = build_logger(cfg, run_dir)
 
     ckpt_dir = run_dir / 'lightning'
     last_ckpt = ckpt_dir / 'last.ckpt'
@@ -200,6 +200,7 @@ def run(cfg):
             every_n_epochs=cfg.checkpointing.every_n_epochs,
             probe_cfg=probe_cfg,
             device=cfg.get('device', 'cpu'),
+            pl_logger=pl_logger,
         ),
     ]
 
@@ -221,16 +222,10 @@ def run(cfg):
 
 
 def _run_post_training(cfg, model, pl_logger):
-    """Run CEM planning eval after training and log to W&B."""
+    """Run CEM planning eval after training and log results."""
     pt = cfg.get('post_training', {})
     if not pt:
         return
-
-    import wandb
-
-    def _wandb_log(metrics: dict):
-        if wandb.run is not None:
-            wandb.log(metrics)
 
     # ── CEM planning evaluation ─────────────────────────────────────────────
     if pt.get('run_eval', False):
@@ -273,12 +268,14 @@ def _run_post_training(cfg, model, pl_logger):
             'eval/evaluation_time': eval_metrics.get('evaluation_time', float('nan')),
         }
 
-        import wandb
-        if wandb.run is not None:
-            # Log scalars
-            wandb.log(scalar_metrics)
+        log_metrics(pl_logger, scalar_metrics)
+        logging.info(scalar_metrics)
+        logging.info(f"Eval success_rate: {eval_metrics.get('success_rate'):.1f}%")
 
-            # Log rollout videos — cap at 10 to keep artifact size small
+        # Rollout videos — W&B only (native video artifact support)
+        from lightning.pytorch.loggers import WandbLogger
+        if isinstance(pl_logger, WandbLogger):
+            import wandb
             videos = sorted(video_dir.glob('env_*.mp4'))
             successes = eval_metrics.get('episode_successes', [])
             video_log = {}
@@ -291,10 +288,6 @@ def _run_post_training(cfg, model, pl_logger):
             if video_log:
                 wandb.log(video_log)
                 logging.info(f'Logged {len(video_log)} rollout videos to W&B')
-        else:
-            logging.info(scalar_metrics)
-
-        logging.info(f"Eval success_rate: {eval_metrics.get('success_rate'):.1f}%")
 
 
 if __name__ == '__main__':

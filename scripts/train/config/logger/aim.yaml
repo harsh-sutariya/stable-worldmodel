@@ -1,0 +1,3 @@
+_target_: aim.pytorch_lightning.AimLogger
+experiment: ${output_model_name}
+repo: "."
