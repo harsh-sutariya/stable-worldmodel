@@ -25,6 +25,7 @@ dependencies = [
   "typer",
   "rich",
   "hydra-core",
+  "aim>=3.29.1",
 ]
 
 [project.scripts]
