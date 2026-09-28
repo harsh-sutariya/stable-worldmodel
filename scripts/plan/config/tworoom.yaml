@@ -9,7 +9,7 @@ world:
   num_envs: ${eval.num_eval}
   max_episode_steps: 300  # 2× eval_budget
 seed: 42
-policy: lewm_tworoom_expert/weights_epoch_0010.pt
+policy: lewm_tworoom/weights_epoch_0010.pt
 
 plan_config:
   horizon: 1
@@ -26,8 +26,8 @@ dataset:
 # Paper Appendix E: TwoRoom evaluation settings
 eval:
   num_eval: 50
-  goal_offset_steps: 100  # goal sampled 100 steps ahead in trajectory
-  eval_budget: 150         # agent has 150 steps to reach goal
+  goal_offset_steps: 25    # paper: goal sampled 25 steps ahead in trajectory
+  eval_budget: 50          # paper: agent has 50 steps to reach goal
   img_size: 56             # match training resolution
   dataset_name: tworoom.h5
   callables:

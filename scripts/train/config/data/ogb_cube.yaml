@@ -1,0 +1,35 @@
+# @package _global_
+
+data:
+  dataset:
+    name: galilai-group/ogb_cube_single
+    num_steps: ${eval:'${wm.num_preds} + ${wm.history_size}'}
+    frameskip: 5
+    keys_to_load:
+      - pixels
+      - action
+      - observation
+    keys_to_cache:
+      - action
+      - observation
+
+# Paper (Appendix D): OGBench-Cube model overrides
+img_size: 56
+wm:
+  history_size: 3
+
+# AGIR losses
+loss:
+  curv:
+    weight: 0.01
+  agir:
+    weight: 0.01
+    sigma_act: 1.0
+
+trainer:
+  max_epochs: 10
+
+# Post-training pipeline — configure after training
+post_training:
+  run_probe: false
+  run_eval: false
