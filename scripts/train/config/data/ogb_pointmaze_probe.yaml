@@ -1,0 +1,14 @@
+# @package _global_
+
+data:
+  dataset:
+    num_steps: 1
+    frameskip: 1
+    name: ogb_pointmaze_large.lance
+    keys_to_load:
+      - pixels
+      - xy
+      - qpos
+      - qvel
+      - reward
+      - success
