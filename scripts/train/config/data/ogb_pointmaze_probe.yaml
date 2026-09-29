@@ -8,7 +8,4 @@ data:
     keys_to_load:
       - pixels
       - xy
-      - qpos
-      - qvel
       - reward
-      - success
