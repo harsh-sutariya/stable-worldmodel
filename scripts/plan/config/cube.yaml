@@ -7,7 +7,7 @@ defaults:
 world:
   env_name: swm/OGBCube-v0
   num_envs: ${eval.num_eval}
-  max_episode_steps: ??? # make sure it's >= eval_budget
+  max_episode_steps: 100  # 2× eval_budget
   env_type: single
   ob_type: states
   multiview: False
@@ -20,9 +20,13 @@ dataset:
   stats: ${eval.dataset_name}
   keys_to_cache:
     - action
+    - qpos
+    - qvel
+    - privileged_block_0_pos
+    - privileged_block_0_quat
 
 seed: 42
-policy: random # ckpt name or random
+policy: lewm_agir_cube/weights_epoch_0010.pt
 
 plan_config:
   horizon: 5
@@ -37,8 +41,8 @@ eval:
   num_eval: 50
   goal_offset_steps: 25
   eval_budget: 50
-  img_size: 224
-  dataset_name: ogbench/cube_single_expert.h5
+  img_size: 56
+  dataset_name: galilai-group/ogb_cube_single
   callables:
     # -- set state
     - method: set_state
