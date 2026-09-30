@@ -73,7 +73,8 @@ def eval_model(cfg: DictConfig, model=None) -> dict:
     ), 'Planning horizon must be smaller than or equal to eval_budget'
 
     cfg.world.max_episode_steps = 2 * cfg.eval.eval_budget
-    world = swm.World(**cfg.world, image_shape=(224, 224))
+    img_size = cfg.eval.img_size
+    world = swm.World(**cfg.world, image_shape=(img_size, img_size))
 
     img_dtype = torch.bfloat16 if cfg.get('bf16', False) else torch.float32
     transform = {

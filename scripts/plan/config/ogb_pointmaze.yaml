@@ -1,0 +1,53 @@
+defaults:
+  - launcher: local
+  - solver: cem
+  - objective: goal_mse
+  - _self_
+
+world:
+  env_name: swm/OGBMaze-v0
+  num_envs: ${eval.num_eval}
+  max_episode_steps: 500
+  loco_env_type: point
+  maze_env_type: maze
+  maze_type: large
+  ob_type: pixels
+  width: 64
+  height: 64
+
+seed: 42
+policy: lewm_agir_pointmaze/weights_epoch_0010.pt
+
+plan_config:
+  horizon: 1
+  receding_horizon: 1
+  action_block: 2   # match training frameskip=2
+  history_len: 3    # match training history_size=3
+
+dataset:
+  stats: ${eval.dataset_name}
+  keys_to_cache:
+    - action
+    - xy
+
+eval:
+  num_eval: 20
+  goal_offset_steps: 50
+  eval_budget: 200
+  img_size: 64
+  dataset_name: ogb_pointmaze_large.lance
+  callables:
+    - method: _set_state
+      args:
+        xy:
+          value: xy
+    - method: _set_goal_state
+      args:
+        goal_xy:
+          value: goal_xy
+
+compile: false
+bf16: false
+
+output:
+  filename: pointmaze_results.txt
