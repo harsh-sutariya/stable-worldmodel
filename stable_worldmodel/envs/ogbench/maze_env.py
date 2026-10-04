@@ -128,8 +128,8 @@ class MazeEnv(gym.Wrapper):
                 to goal) or ``'ball'`` (push a ball to goal).  Defaults to
                 ``'maze'``.
             maze_type (str): Maze layout.  One of ``'arena'``, ``'medium'``,
-                ``'large'``, ``'giant'``, ``'teleport'``.  Defaults to
-                ``'large'``.
+                ``'large'``, ``'giant'``, ``'teleport'``, ``'umaze'``.
+                Defaults to ``'large'``.
             ob_type (str): Observation type forwarded to ``make_maze_env``.
                 Either ``'states'`` or ``'pixels'``.  Defaults to
                 ``'pixels'`` so that ``info['goal']`` is a rendered image

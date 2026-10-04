@@ -2,6 +2,7 @@
 
 Usage:
     uv run python scripts/data/collect_pointmaze.py
+    uv run python scripts/data/collect_pointmaze.py --maze_type umaze --num_episodes 1000 --max_steps 100
 
 Note: Uses a manual collection loop (not world.collect) for two reasons:
 1. Lance's RecordBatchReader callbacks run on a background thread which has no
@@ -10,6 +11,7 @@ Note: Uses a manual collection loop (not world.collect) for two reasons:
    aren't in the initial reset info. We capture xy directly from the env.
 """
 
+import argparse
 from collections import defaultdict
 from pathlib import Path
 
@@ -19,12 +21,6 @@ from tqdm import tqdm
 import stable_worldmodel as swm
 from stable_worldmodel.data.format import get_format
 from stable_worldmodel.policy import BasePolicy
-
-DATASET_PATH = (
-    Path(swm.data.utils.get_cache_dir())
-    / 'datasets'
-    / 'ogb_pointmaze_large.lance'
-)
 
 NUM_ENVS = 8
 NUM_EPISODES = 3000
@@ -137,28 +133,38 @@ def collect_to_memory(world, episodes, seed):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--maze_type', default='large', help='OGBench maze type (large, umaze, medium, ...)')
+    parser.add_argument('--num_episodes', type=int, default=NUM_EPISODES)
+    parser.add_argument('--max_steps', type=int, default=MAX_EPISODE_STEPS)
+    parser.add_argument('--dataset_name', default=None, help='Override dataset filename (default: ogb_pointmaze_<maze_type>.lance)')
+    args = parser.parse_args()
+
+    dataset_name = args.dataset_name or f'ogb_pointmaze_{args.maze_type}.lance'
+    dataset_path = Path(swm.data.utils.get_cache_dir()) / 'datasets' / dataset_name
+
     world = swm.World(
         'swm/OGBMaze-v0',
         num_envs=NUM_ENVS,
         image_shape=IMAGE_SHAPE,
         loco_env_type='point',
         maze_env_type='maze',
-        maze_type='large',
+        maze_type=args.maze_type,
         ob_type='pixels',
         width=IMAGE_SHAPE[1],
         height=IMAGE_SHAPE[0],
-        max_episode_steps=MAX_EPISODE_STEPS,
+        max_episode_steps=args.max_steps,
     )
     world.set_policy(PointMazeOraclePolicy())
 
-    print(f'Collecting {NUM_EPISODES} episodes with {NUM_ENVS} envs...', flush=True)
-    episodes = collect_to_memory(world, NUM_EPISODES, seed=SEED)
+    print(f'Collecting {args.num_episodes} episodes with {NUM_ENVS} envs...', flush=True)
+    episodes = collect_to_memory(world, args.num_episodes, seed=SEED)
 
-    print(f'Collected {len(episodes)} episodes. Writing to {DATASET_PATH}...', flush=True)
-    DATASET_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with get_format('lance').open_writer(DATASET_PATH) as w:
+    print(f'Collected {len(episodes)} episodes. Writing to {dataset_path}...', flush=True)
+    dataset_path.parent.mkdir(parents=True, exist_ok=True)
+    with get_format('lance').open_writer(dataset_path) as w:
         w.write_episodes(iter(episodes))
-    print(f'Done. Dataset saved to {DATASET_PATH}', flush=True)
+    print(f'Done. Dataset saved to {dataset_path}', flush=True)
 
 
 if __name__ == '__main__':
