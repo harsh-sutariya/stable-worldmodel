@@ -19,8 +19,8 @@ seed: 42
 policy: lewm_agir_umaze/weights_epoch_0010.pt
 
 plan_config:
-  horizon: 1
-  receding_horizon: 1
+  horizon: 5
+  receding_horizon: 5
   action_block: 2
   history_len: 3
 
