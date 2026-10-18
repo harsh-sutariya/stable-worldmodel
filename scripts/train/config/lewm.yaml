@@ -2,6 +2,7 @@ defaults:
   - _self_
   - launcher: local
   - data: pusht
+  - logger: aim
 
 hydra:
   job:
@@ -33,13 +34,6 @@ checkpointing:
   every_n_epochs: 5         # how often to save deployable .pt weights
   save_top_k: 3             # Lightning ckpts to retain (ranked by val/loss)
   resume_every_n_steps: 500 # overwrite last.ckpt this often for mid-epoch resume
-
-wandb:
-  enabled: true
-  project: stable-wm
-  entity: null         # set to your W&B entity/username
-  name: ${output_model_name}
-  log_model: false
 
 loader:
   batch_size: 128
@@ -108,11 +102,11 @@ loss:
       knots: 17
       num_proj: 1024
   curv:
-    weight: 0.0    # λ_curv: temporal straightening (Wang et al. 2026); enable per-env
+    weight: 0.01   # λ_curv: temporal straightening (Wang et al. 2026)
   speed:
     weight: 0.0    # λ_speed: disabled — replaced by AGIR (global penalty destroys kinematic mapping)
   agir:
-    weight: 0.0    # λ_agir: Action-Gated Isometric Representation; enable per-env
+    weight: 0.01   # λ_agir: Action-Gated Isometric Representation (set 0 for plain LeWM)
     sigma_act: 1.0 # gate bandwidth in normalised action space; exp(-‖Δa‖/σ)
 
 # Post-training pipeline — disabled by default; override per environment

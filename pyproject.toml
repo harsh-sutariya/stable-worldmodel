@@ -25,6 +25,7 @@ dependencies = [
   "typer",
   "rich",
   "hydra-core",
+  "aim>=3.29.1",
 ]
 
 [project.scripts]
@@ -56,6 +57,9 @@ env = [
     "minigrid",
     "gymnasium[all]",
     "gymnasium-robotics",
+    # gymnasium-robotics (Fetch envs) breaks on mujoco>=3.11: set_joint_qpos
+    # compares joint types against the mjtJoint enum, which now never matches.
+    "mujoco<3.11",
     "opencv-python-headless",
     "stable_baselines3>=2.0.0",
     "craftax>=1.5.0",
@@ -110,6 +114,10 @@ source-exclude = [
 [tool.ruff]
 line-length = 79
 indent-width = 4
+
+[tool.ruff.lint.per-file-ignores]
+# Scripts adjust sys.path before importing sibling modules.
+"scripts/**" = ["E402"]
 
 [tool.ruff.format]
 indent-style = "space"

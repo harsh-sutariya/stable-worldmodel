@@ -673,7 +673,7 @@ def _extract_init_goal(dataset, episodes_idx, start_steps, goal_offset):
         for col in dataset.column_names:
             if col.startswith('goal'):
                 continue
-            if col.startswith('pixels'):
+            if isinstance(ep[col], torch.Tensor) and ep[col].ndim == 4:
                 ep[col] = ep[col].permute(0, 2, 3, 1)
             val = ep[col]
             if not isinstance(val, (torch.Tensor, np.ndarray)):

@@ -305,6 +305,19 @@ def test_legacy_string_table_read_raises(tmp_path):
         LanceDataset(path=tmp_path / 'legacy.lance')
 
 
+def test_legacy_string_table_loads_when_column_excluded(tmp_path):
+    """An explicit ``keys_to_load`` that leaves out the legacy string column
+    makes the table usable; requesting it still raises."""
+    _write_legacy_string_table(tmp_path, 'legacy')
+    path = tmp_path / 'legacy.lance'
+
+    ds = LanceDataset(path=path, keys_to_load=['action'])
+    assert len(ds) > 0
+
+    with pytest.raises(ValueError, match='legacy layout'):
+        LanceDataset(path=path, keys_to_load=['action', 'model_xml'])
+
+
 def test_legacy_string_table_append_raises(tmp_path):
     """The writer refuses to append to legacy tables with per-step string
     columns."""

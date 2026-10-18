@@ -363,6 +363,13 @@ class LanceDataset(Dataset):
                 pa.types.is_string(f.type) or pa.types.is_large_string(f.type)
             )
         ]
+        # A legacy string column is only a problem if it would be read. With
+        # an explicit ``keys_to_load`` that excludes it, the table is usable;
+        # loading every column (``keys_to_load=None``) still raises.
+        if keys_to_load is not None:
+            legacy_strings = [
+                c for c in legacy_strings if c in set(keys_to_load)
+            ]
         if legacy_strings:
             raise ValueError(
                 f"Lance table '{self.table_name}' at '{self.uri}' contains "

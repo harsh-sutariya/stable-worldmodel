@@ -8,7 +8,6 @@ and report R² on the held-out validation split.
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import hydra
 import numpy as np
@@ -29,7 +28,10 @@ from utils import get_img_preprocessor, setup_run_dir
 # Encoding
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _encode_batch(model, pixels: torch.Tensor, device: str) -> dict[str, np.ndarray]:
+
+def _encode_batch(
+    model, pixels: torch.Tensor, device: str
+) -> dict[str, np.ndarray]:
     """Return embeddings at every probe level for one batch of pixels.
 
     pixels: (B, 1, C, H, W) — single-frame windows from the dataset.
@@ -41,7 +43,7 @@ def _encode_batch(model, pixels: torch.Tensor, device: str) -> dict[str, np.ndar
     with torch.no_grad():
         out = model.encoder(x, interpolate_pos_encoding=True)
         hidden = out.last_hidden_state  # (B, L+1, D)
-        cls = hidden[:, 0]             # CLS token
+        cls = hidden[:, 0]  # CLS token
         patches_mean = hidden[:, 1:].mean(dim=1)
         projected = model.projector(cls)
 
@@ -73,19 +75,24 @@ def encode_dataset(
             level_buffers.setdefault(level, []).append(arr)
         for t in probe_targets:
             if t in batch:
-                v = batch[t].squeeze(1)   # (B, 1, *) → (B, *)
+                v = batch[t].squeeze(1)  # (B, 1, *) → (B, *)
                 if v.dim() > 2:
-                    v = v.squeeze(-1)     # (B, 1) → (B,)
+                    v = v.squeeze(-1)  # (B, 1) → (B,)
                 target_buffers[t].append(v.float().cpu().numpy())
 
-    embeddings = {k: np.concatenate(v, axis=0) for k, v in level_buffers.items()}
-    targets = {k: np.concatenate(v, axis=0) for k, v in target_buffers.items() if v}
+    embeddings = {
+        k: np.concatenate(v, axis=0) for k, v in level_buffers.items()
+    }
+    targets = {
+        k: np.concatenate(v, axis=0) for k, v in target_buffers.items() if v
+    }
     return embeddings, targets
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Probing
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _valid_mask(emb: np.ndarray, target: np.ndarray) -> np.ndarray:
     """Boolean mask of rows with no NaN/inf in either emb or target."""
@@ -155,6 +162,7 @@ def probe_level(
 # Public API (callable without Hydra)
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def probe_model(model, probe_cfg, device: str) -> dict[str, dict]:
     """Run linear probing on a frozen model and return results dict.
 
@@ -165,13 +173,14 @@ def probe_model(model, probe_cfg, device: str) -> dict[str, dict]:
     Accepts both OmegaConf nodes and plain dicts.
     """
     from omegaconf import OmegaConf as _OC
+
     if hasattr(probe_cfg, '_metadata'):  # OmegaConf node
         cfg_d = _OC.to_container(probe_cfg, resolve=True)
     else:
         cfg_d = dict(probe_cfg)
 
     probe_targets = list(cfg_d['probe_targets'])
-    probe_levels  = list(cfg_d['probe_levels'])
+    probe_levels = list(cfg_d['probe_levels'])
 
     was_training = model.training
     saved_grad = {n: p.requires_grad for n, p in model.named_parameters()}
@@ -183,46 +192,76 @@ def probe_model(model, probe_cfg, device: str) -> dict[str, dict]:
         num_steps=cfg_d.get('num_steps', 1),
         frameskip=cfg_d.get('frameskip', 1),
     )
-    dataset.transform = get_img_preprocessor('pixels', 'pixels', cfg_d['img_size'])
+    dataset.transform = get_img_preprocessor(
+        'pixels', 'pixels', cfg_d['img_size']
+    )
 
     rng = torch.Generator().manual_seed(cfg_d['seed'])
     train_set, val_set = spt.data.random_split(
-        dataset, [cfg_d['train_split'], 1 - cfg_d['train_split']], generator=rng
+        dataset,
+        [cfg_d['train_split'], 1 - cfg_d['train_split']],
+        generator=rng,
     )
 
     # Subsample training set to avoid OOM in Ridge SVD (e.g. PushT has ~2M frames)
     max_train = cfg_d.get('max_train_samples', None)
     if max_train is not None and len(train_set) > max_train:
-        indices = torch.randperm(len(train_set), generator=rng)[:max_train].tolist()
+        indices = torch.randperm(len(train_set), generator=rng)[
+            :max_train
+        ].tolist()
         train_set = torch.utils.data.Subset(train_set, indices)
-        logging.info(f'[probe] subsampled train set to {len(train_set):,} frames (max_train_samples={max_train})')
+        logging.info(
+            f'[probe] subsampled train set to {len(train_set):,} frames (max_train_samples={max_train})'
+        )
 
     num_workers = cfg_d.get('num_workers', 0)
-    train_loader = DataLoader(train_set, batch_size=cfg_d.get('batch_size', 512),
-                              shuffle=False, num_workers=num_workers, drop_last=False)
-    val_loader   = DataLoader(val_set,   batch_size=cfg_d.get('batch_size', 512),
-                              shuffle=False, num_workers=num_workers, drop_last=False)
+    train_loader = DataLoader(
+        train_set,
+        batch_size=cfg_d.get('batch_size', 512),
+        shuffle=False,
+        num_workers=num_workers,
+        drop_last=False,
+    )
+    val_loader = DataLoader(
+        val_set,
+        batch_size=cfg_d.get('batch_size', 512),
+        shuffle=False,
+        num_workers=num_workers,
+        drop_last=False,
+    )
 
     try:
-        logging.info(f'[probe] encoding {len(train_set):,} train / {len(val_set):,} val frames...')
-        train_embs, train_targets = encode_dataset(model, train_loader, probe_targets, device)
-        val_embs,   val_targets   = encode_dataset(model, val_loader,   probe_targets, device)
+        logging.info(
+            f'[probe] encoding {len(train_set):,} train / {len(val_set):,} val frames...'
+        )
+        train_embs, train_targets = encode_dataset(
+            model, train_loader, probe_targets, device
+        )
+        val_embs, val_targets = encode_dataset(
+            model, val_loader, probe_targets, device
+        )
 
         results: dict[str, dict] = {}
         for level in probe_levels:
             if level not in train_embs:
-                logging.warning(f'[probe] level {level!r} not found, skipping.')
+                logging.warning(
+                    f'[probe] level {level!r} not found, skipping.'
+                )
                 continue
             logging.info(f'[probe] probing level: {level}')
             results[level] = probe_level(
-                train_embs[level], val_embs[level],
-                train_targets, val_targets,
+                train_embs[level],
+                val_embs[level],
+                train_targets,
+                val_targets,
                 alpha=cfg_d['ridge_alpha'],
             )
 
         # print table
         col_w = max(len(t) for t in probe_targets) + 2
-        header = f"{'variable':<{col_w}}" + ''.join(f'{l:>18}' for l in probe_levels)
+        header = f'{"variable":<{col_w}}' + ''.join(
+            f'{level:>18}' for level in probe_levels
+        )
         sep = '─' * len(header)
         print(f'\n{sep}\nLinear Probing Results  (R²)\n{sep}')
         print(header)
@@ -230,7 +269,11 @@ def probe_model(model, probe_cfg, device: str) -> dict[str, dict]:
         for target in probe_targets:
             row = f'{target:<{col_w}}'
             for level in probe_levels:
-                r2 = results.get(level, {}).get(target, {}).get('mean', float('nan'))
+                r2 = (
+                    results.get(level, {})
+                    .get(target, {})
+                    .get('mean', float('nan'))
+                )
                 row += f'{r2:>18.4f}'
             print(row)
         print(sep)
@@ -248,6 +291,7 @@ def probe_model(model, probe_cfg, device: str) -> dict[str, dict]:
 # Hydra entry point (standalone usage)
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @hydra.main(version_base=None, config_path='./config', config_name='probe')
 def run(cfg):
     device = cfg.get('device', 'cpu')
@@ -258,15 +302,15 @@ def run(cfg):
 
     dataset_cfg = OmegaConf.to_container(cfg.data.dataset, resolve=True)
     probe_cfg = {
-        'dataset_name':  dataset_cfg.pop('name'),
-        'keys_to_load':  dataset_cfg.pop('keys_to_load'),
+        'dataset_name': dataset_cfg.pop('name'),
+        'keys_to_load': dataset_cfg.pop('keys_to_load'),
         **dataset_cfg,
-        'img_size':      cfg.img_size,
-        'train_split':   cfg.train_split,
-        'seed':          cfg.seed,
-        'ridge_alpha':   cfg.ridge_alpha,
-        'batch_size':    cfg.batch_size,
-        'probe_levels':  list(cfg.probe_levels),
+        'img_size': cfg.img_size,
+        'train_split': cfg.train_split,
+        'seed': cfg.seed,
+        'ridge_alpha': cfg.ridge_alpha,
+        'batch_size': cfg.batch_size,
+        'probe_levels': list(cfg.probe_levels),
         'probe_targets': list(cfg.probe_targets),
     }
 
@@ -277,12 +321,21 @@ def run(cfg):
     with open(out_path, 'w') as f:
         json.dump(
             {
-                'model':      cfg.model_name,
-                'dataset':    probe_cfg['dataset_name'],
-                'n_train':    int(0.9 * len(swm.data.load_dataset(probe_cfg['dataset_name'],
-                                  keys_to_load=['pixels'], num_steps=1, frameskip=1))),
+                'model': cfg.model_name,
+                'dataset': probe_cfg['dataset_name'],
+                'n_train': int(
+                    0.9
+                    * len(
+                        swm.data.load_dataset(
+                            probe_cfg['dataset_name'],
+                            keys_to_load=['pixels'],
+                            num_steps=1,
+                            frameskip=1,
+                        )
+                    )
+                ),
                 'ridge_alpha': cfg.ridge_alpha,
-                'results':    results,
+                'results': results,
             },
             f,
             indent=2,

@@ -26,15 +26,15 @@ import stable_pretraining as spt
 import stable_worldmodel as swm
 from stable_worldmodel.wm.utils import load_pretrained
 
-DATASET    = 'galilai-group/lewm-pusht'
-IMG_SIZE   = 56
-FRAMESKIP  = 5
-CTX_LEN    = 3
-ACTION_DIM = 10      # frameskip(5) × raw_action_dim(2)
-BATCH_SIZE = 256     # large batch for stable statistics
-NUM_TRAJ   = 300     # for exp6
-TRAJ_LEN   = 35
-DEVICE     = 'mps'
+DATASET = 'galilai-group/lewm-pusht'
+IMG_SIZE = 56
+FRAMESKIP = 5
+CTX_LEN = 3
+ACTION_DIM = 10  # frameskip(5) × raw_action_dim(2)
+BATCH_SIZE = 256  # large batch for stable statistics
+NUM_TRAJ = 300  # for exp6
+TRAJ_LEN = 35
+DEVICE = 'mps'
 
 
 def pixel_transform():
@@ -48,16 +48,22 @@ def pixel_transform():
 def load_context_batch(device, num_steps=CTX_LEN + 1, batch_size=BATCH_SIZE):
     """Load one large batch of CTX_LEN+1 frame windows with actions."""
     dataset = swm.data.load_dataset(
-        DATASET, num_steps=num_steps, frameskip=FRAMESKIP,
+        DATASET,
+        num_steps=num_steps,
+        frameskip=FRAMESKIP,
         keys_to_load=['pixels', 'action'],
     )
     dataset.transform = pixel_transform()
     loader = torch.utils.data.DataLoader(
-        dataset, batch_size=batch_size, shuffle=True, num_workers=0, drop_last=True
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+        drop_last=True,
     )
     batch = next(iter(loader))
-    pixels  = batch['pixels'].to(device)   # (B, num_steps, C, H, W)
-    actions = batch['action'].to(device)   # (B, num_steps, ...)
+    pixels = batch['pixels'].to(device)  # (B, num_steps, C, H, W)
+    actions = batch['action'].to(device)  # (B, num_steps, ...)
     return pixels, actions
 
 
@@ -66,8 +72,8 @@ def encode_ctx(model, pixels, device):
     """Encode CTX_LEN frames → projector embeddings (B, CTX, D)."""
     B, T = pixels.shape[:2]
     flat = pixels.view(B * T, *pixels.shape[2:])
-    cls  = model.encoder(flat).last_hidden_state[:, 0]
-    emb  = model.projector(cls).view(B, T, -1)
+    cls = model.encoder(flat).last_hidden_state[:, 0]
+    emb = model.projector(cls).view(B, T, -1)
     return emb
 
 
@@ -76,13 +82,16 @@ def prep_actions(actions, B, T, device):
     act = actions.view(B, T, -1).float()
     d = act.shape[-1]
     if d < ACTION_DIM:
-        act = torch.cat([act, torch.zeros(B, T, ACTION_DIM - d, device=device)], dim=-1)
+        act = torch.cat(
+            [act, torch.zeros(B, T, ACTION_DIM - d, device=device)], dim=-1
+        )
     else:
         act = act[..., :ACTION_DIM]
     return act
 
 
 # ── Experiment 4: Action Sensitivity ─────────────────────────────────────────
+
 
 @torch.no_grad()
 def exp4_action_sensitivity(model, device):
@@ -100,47 +109,50 @@ def exp4_action_sensitivity(model, device):
     B = pixels.size(0)
 
     # encode context (CTX_LEN frames) and ground truth next frame
-    emb_full = encode_ctx(model, pixels, device)        # (B, CTX+1, D)
-    ctx_emb  = emb_full[:, :CTX_LEN]                   # (B, CTX, D)
-    last_ctx = ctx_emb[:, -1]                           # (B, D)  — z_t
+    emb_full = encode_ctx(model, pixels, device)  # (B, CTX+1, D)
+    ctx_emb = emb_full[:, :CTX_LEN]  # (B, CTX, D)
+    last_ctx = ctx_emb[:, -1]  # (B, D)  — z_t
 
-    act_raw = prep_actions(actions, B, CTX_LEN + 1, device)[:, :CTX_LEN]  # (B, CTX, 10)
+    act_raw = prep_actions(actions, B, CTX_LEN + 1, device)[
+        :, :CTX_LEN
+    ]  # (B, CTX, 10)
     act_std = max(act_raw.std().item(), 1e-3)
 
     # real action embedding
-    act_emb_real    = model.action_encoder(act_raw)                          # (B, CTX, A)
+    act_emb_real = model.action_encoder(act_raw)  # (B, CTX, A)
 
     # shuffled: permute batch dimension → same marginal, broken conditional
     perm = torch.randperm(B, device=device)
-    act_emb_shuffle = model.action_encoder(act_raw[perm])                    # (B, CTX, A)
+    act_emb_shuffle = model.action_encoder(act_raw[perm])  # (B, CTX, A)
 
     # OOD: Gaussian with 5× the real action std
     act_ood = torch.randn_like(act_raw) * act_std * 5
-    act_emb_ood = model.action_encoder(act_ood)                              # (B, CTX, A)
+    act_emb_ood = model.action_encoder(act_ood)  # (B, CTX, A)
 
     # predictions
-    pred_real    = model.predict(ctx_emb, act_emb_real)[:, -1]    # (B, D)
+    pred_real = model.predict(ctx_emb, act_emb_real)[:, -1]  # (B, D)
     pred_shuffle = model.predict(ctx_emb, act_emb_shuffle)[:, -1]
-    pred_ood     = model.predict(ctx_emb, act_emb_ood)[:, -1]
+    pred_ood = model.predict(ctx_emb, act_emb_ood)[:, -1]
 
     div_shuffle = (pred_real - pred_shuffle).norm(p=2, dim=-1).mean().item()
-    div_ood     = (pred_real - pred_ood).norm(p=2, dim=-1).mean().item()
+    div_ood = (pred_real - pred_ood).norm(p=2, dim=-1).mean().item()
 
     # identity residual: how far pred moved from z_t
-    id_res_real    = (pred_real    - last_ctx).norm(p=2, dim=-1).mean().item()
+    id_res_real = (pred_real - last_ctx).norm(p=2, dim=-1).mean().item()
     id_res_shuffle = (pred_shuffle - last_ctx).norm(p=2, dim=-1).mean().item()
-    id_res_ood     = (pred_ood     - last_ctx).norm(p=2, dim=-1).mean().item()
+    id_res_ood = (pred_ood - last_ctx).norm(p=2, dim=-1).mean().item()
 
     return {
-        'div_shuffle':     div_shuffle,
-        'div_ood':         div_ood,
-        'id_res_real':     id_res_real,
-        'id_res_shuffle':  id_res_shuffle,
-        'id_res_ood':      id_res_ood,
+        'div_shuffle': div_shuffle,
+        'div_ood': div_ood,
+        'id_res_real': id_res_real,
+        'id_res_shuffle': id_res_shuffle,
+        'id_res_ood': id_res_ood,
     }
 
 
 # ── Experiment 5: Predictor Identity Metric ──────────────────────────────────
+
 
 @torch.no_grad()
 def exp5_residual_ratio(model, device):
@@ -163,18 +175,18 @@ def exp5_residual_ratio(model, device):
     pixels, actions = load_context_batch(device)
     B = pixels.size(0)
 
-    emb_full = encode_ctx(model, pixels, device)        # (B, CTX+1, D)
-    ctx_emb  = emb_full[:, :CTX_LEN]                   # (B, CTX, D)
-    z_next   = emb_full[:, CTX_LEN]                    # (B, D)  — true z_{t+1}
-    z_t      = ctx_emb[:, -1]                          # (B, D)  — z_t
+    emb_full = encode_ctx(model, pixels, device)  # (B, CTX+1, D)
+    ctx_emb = emb_full[:, :CTX_LEN]  # (B, CTX, D)
+    z_next = emb_full[:, CTX_LEN]  # (B, D)  — true z_{t+1}
+    z_t = ctx_emb[:, -1]  # (B, D)  — z_t
 
-    act_raw  = prep_actions(actions, B, CTX_LEN + 1, device)[:, :CTX_LEN]
-    act_emb  = model.action_encoder(act_raw)
+    act_raw = prep_actions(actions, B, CTX_LEN + 1, device)[:, :CTX_LEN]
+    act_emb = model.action_encoder(act_raw)
 
     pred_next = model.predict(ctx_emb, act_emb)[:, -1]  # (B, D)
 
-    true_step = (z_next  - z_t).norm(p=2, dim=-1).cpu().numpy()  # (B,)
-    pred_step = (pred_next - z_t).norm(p=2, dim=-1).cpu().numpy() # (B,)
+    true_step = (z_next - z_t).norm(p=2, dim=-1).cpu().numpy()  # (B,)
+    pred_step = (pred_next - z_t).norm(p=2, dim=-1).cpu().numpy()  # (B,)
 
     ratio = float(pred_step.mean() / (true_step.mean() + 1e-12))
     r_step, p_step = pearsonr(true_step, pred_step)
@@ -185,21 +197,24 @@ def exp5_residual_ratio(model, device):
     return {
         'true_step_mean': float(true_step.mean()),
         'pred_step_mean': float(pred_step.mean()),
-        'ratio':          ratio,
+        'ratio': ratio,
         'pearson_r_step': float(r_step),
-        'p_step':         float(p_step),
-        'pred_mse':       mse,
+        'p_step': float(p_step),
+        'pred_mse': mse,
     }
 
 
 # ── Experiment 6: Trajectory-to-Global Volume Ratio ──────────────────────────
+
 
 @torch.no_grad()
 def load_trajectories(model, device):
     """Return Z (N, T, D) projector embeddings."""
     transform = pixel_transform()
     dataset = swm.data.load_dataset(
-        DATASET, num_steps=TRAJ_LEN, frameskip=FRAMESKIP,
+        DATASET,
+        num_steps=TRAJ_LEN,
+        frameskip=FRAMESKIP,
         keys_to_load=['pixels'],
     )
     dataset.transform = transform
@@ -212,8 +227,8 @@ def load_trajectories(model, device):
         pixels = batch['pixels'].to(device)
         B, T = pixels.shape[:2]
         flat = pixels.view(B * T, *pixels.shape[2:])
-        cls  = model.encoder(flat).last_hidden_state[:, 0]
-        emb  = model.projector(cls).view(B, T, -1).cpu().float()
+        cls = model.encoder(flat).last_hidden_state[:, 0]
+        emb = model.projector(cls).view(B, T, -1).cpu().float()
         Z_list.append(emb.numpy())
         collected += B
         if collected >= NUM_TRAJ:
@@ -244,53 +259,58 @@ def exp6_volume_ratio(Z):
     # local per trajectory
     local_traces = np.array([np.var(Z[n], axis=0).sum() for n in range(N)])
     local_trace_mean = float(local_traces.mean())
-    local_trace_std  = float(local_traces.std())
+    local_trace_std = float(local_traces.std())
 
     ratio = local_trace_mean / (global_trace + 1e-12)
 
     # participation ratio of local covariance (mean over trajectories)
     # PR = (sum eigenvalues)^2 / sum(eigenvalues^2) — effective dimension
     pr_list = []
-    for n in range(min(N, 100)):   # cap at 100 for speed
-        cov = np.cov(Z[n].T)       # (D, D)
+    for n in range(min(N, 100)):  # cap at 100 for speed
+        cov = np.cov(Z[n].T)  # (D, D)
         eigvals = np.linalg.eigvalsh(cov)
         eigvals = np.maximum(eigvals, 0)
         s = eigvals.sum()
         if s > 1e-10:
-            pr_list.append((s ** 2) / (np.sum(eigvals ** 2) + 1e-20))
+            pr_list.append((s**2) / (np.sum(eigvals**2) + 1e-20))
     local_pr_mean = float(np.mean(pr_list)) if pr_list else float('nan')
 
     # global PR for reference
     cov_global = np.cov(Z_flat.T)
-    ev_global  = np.linalg.eigvalsh(cov_global)
-    ev_global  = np.maximum(ev_global, 0)
+    ev_global = np.linalg.eigvalsh(cov_global)
+    ev_global = np.maximum(ev_global, 0)
     s = ev_global.sum()
-    global_pr  = float((s ** 2) / (np.sum(ev_global ** 2) + 1e-20)) if s > 1e-10 else float('nan')
+    global_pr = (
+        float((s**2) / (np.sum(ev_global**2) + 1e-20))
+        if s > 1e-10
+        else float('nan')
+    )
 
     return {
-        'global_trace':      global_trace,
-        'local_trace_mean':  local_trace_mean,
-        'local_trace_std':   local_trace_std,
-        'ratio':             ratio,
-        'local_pr_mean':     local_pr_mean,
-        'global_pr':         global_pr,
+        'global_trace': global_trace,
+        'local_trace_mean': local_trace_mean,
+        'local_trace_std': local_trace_std,
+        'ratio': ratio,
+        'local_pr_mean': local_pr_mean,
+        'global_pr': global_pr,
     }
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
+
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--ckpt',   required=True)
-    p.add_argument('--tag',    default=None)
+    p.add_argument('--ckpt', required=True)
+    p.add_argument('--tag', default=None)
     p.add_argument('--device', default=DEVICE)
-    p.add_argument('--out',    type=Path, default=None)
+    p.add_argument('--out', type=Path, default=None)
     args = p.parse_args()
 
     tag = args.tag or args.ckpt
-    print(f'\n{"="*60}')
+    print(f'\n{"=" * 60}')
     print(f'Model: {tag}')
-    print(f'{"="*60}')
+    print(f'{"=" * 60}')
 
     model = load_pretrained(args.ckpt)
     model.to(args.device).eval()
@@ -310,7 +330,9 @@ def main():
     print(f'  true_step_mean:  {r5["true_step_mean"]:.6f}')
     print(f'  pred_step_mean:  {r5["pred_step_mean"]:.6f}')
     print(f'  ratio:           {r5["ratio"]:.6f}')
-    print(f'  Pearson r (step magnitudes): {r5["pearson_r_step"]:.4f}  (p={r5["p_step"]:.2e})')
+    print(
+        f'  Pearson r (step magnitudes): {r5["pearson_r_step"]:.4f}  (p={r5["p_step"]:.2e})'
+    )
     print(f'  pred MSE:        {r5["pred_mse"]:.6f}')
 
     # ── Exp 6 ────────────────────────────────────────────────────────────────
@@ -318,12 +340,20 @@ def main():
     Z = load_trajectories(model, args.device)
     r6 = exp6_volume_ratio(Z)
     print(f'  global_trace:       {r6["global_trace"]:.4f}')
-    print(f'  local_trace_mean:   {r6["local_trace_mean"]:.4f}  (±{r6["local_trace_std"]:.4f})')
+    print(
+        f'  local_trace_mean:   {r6["local_trace_mean"]:.4f}  (±{r6["local_trace_std"]:.4f})'
+    )
     print(f'  ratio:              {r6["ratio"]:.6f}')
     print(f'  local PR (eff dim): {r6["local_pr_mean"]:.2f}')
     print(f'  global PR (eff dim):{r6["global_pr"]:.2f}')
 
-    result = {'tag': tag, 'ckpt': args.ckpt, 'exp4': r4, 'exp5': r5, 'exp6': r6}
+    result = {
+        'tag': tag,
+        'ckpt': args.ckpt,
+        'exp4': r4,
+        'exp5': r5,
+        'exp6': r6,
+    }
 
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)

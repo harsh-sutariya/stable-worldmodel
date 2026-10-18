@@ -1,0 +1,5 @@
+# Opt-in learned goal distance; the default objective is goal_mse (raw L2).
+# Usage: objective=quasimetric objective.ckpt_path=<run>/qm_head.pt
+# Train the head first with scripts/train/train_quasimetric.py.
+_target_: stable_worldmodel.planning.QuasimetricCost
+ckpt_path: ???

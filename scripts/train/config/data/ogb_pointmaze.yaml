@@ -1,0 +1,25 @@
+# @package _global_
+
+data:
+  dataset:
+    name: ogb_pointmaze_large.lance
+    num_steps: ${eval:'${wm.num_preds} + ${wm.history_size}'}
+    frameskip: 2
+    keys_to_load:
+      - pixels
+      - action
+      - xy
+    keys_to_cache:
+      - action
+      - xy
+
+img_size: 64
+wm:
+  history_size: 3
+
+trainer:
+  max_epochs: 10
+
+post_training:
+  run_probe: false
+  run_eval: false

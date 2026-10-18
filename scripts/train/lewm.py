@@ -6,7 +6,6 @@ from pathlib import Path
 import hydra
 import lightning as pl
 import stable_pretraining as spt
-from stable_pretraining import data as dt
 import stable_worldmodel as swm
 import torch
 import torch.nn.functional as F
@@ -17,7 +16,13 @@ from omegaconf import OmegaConf, open_dict
 from stable_worldmodel.data import column_normalizer as get_column_normalizer
 from stable_worldmodel.wm.loss import SIGReg
 
-from utils import SaveCkptCallback, build_wandb_logger, get_img_preprocessor, setup_run_dir
+from utils import (
+    SaveCkptCallback,
+    build_logger,
+    get_img_preprocessor,
+    log_metrics,
+    setup_run_dir,
+)
 
 # Make scripts/plan importable for eval_model
 sys.path.insert(0, str(Path(__file__).parent.parent / 'plan'))
@@ -28,15 +33,15 @@ def lejepa_forward(self, batch, stage, cfg):
     ctx_len = cfg.wm.history_size
     n_preds = cfg.wm.num_preds
     lambd = cfg.loss.sigreg.weight
-    lambd_curv  = cfg.loss.get('curv',  {}).get('weight', 0.0)
+    lambd_curv = cfg.loss.get('curv', {}).get('weight', 0.0)
     lambd_speed = cfg.loss.get('speed', {}).get('weight', 0.0)
-    lambd_agir  = cfg.loss.get('agir',  {}).get('weight', 0.0)
-    sigma_act   = cfg.loss.get('agir',  {}).get('sigma_act', 1.0)
+    lambd_agir = cfg.loss.get('agir', {}).get('weight', 0.0)
+    sigma_act = cfg.loss.get('agir', {}).get('sigma_act', 1.0)
 
     batch['action'] = torch.nan_to_num(batch['action'], 0.0)
 
     output = self.model.encode(batch)
-    emb = output['emb']       # (B, T, D)
+    emb = output['emb']  # (B, T, D)
     act_emb = output['act_emb']
 
     ctx_emb = emb[:, :ctx_len]
@@ -50,10 +55,11 @@ def lejepa_forward(self, batch, stage, cfg):
     # Temporal straightening: penalise curvature of encoder trajectories.
     # vel: (B, T-1, D) — consecutive displacement vectors in latent space
     # curv: 1 - cos(v_t, v_{t+1}) averaged over all consecutive velocity pairs
-    vel = emb[:, 1:, :] - emb[:, :-1, :]                                   # (B, T-1, D)
-    cos_sim = F.cosine_similarity(vel[:, :-1, :], vel[:, 1:, :],
-                                  dim=-1, eps=1e-6)                          # (B, T-2)
-    output['curv_loss']  = (1.0 - cos_sim).mean()
+    vel = emb[:, 1:, :] - emb[:, :-1, :]  # (B, T-1, D)
+    cos_sim = F.cosine_similarity(
+        vel[:, :-1, :], vel[:, 1:, :], dim=-1, eps=1e-6
+    )  # (B, T-2)
+    output['curv_loss'] = (1.0 - cos_sim).mean()
 
     # Global speed penalty (disabled when AGIR is active; kept for ablations).
     output['speed_loss'] = vel.norm(p=2, dim=-1).mean()
@@ -65,18 +71,18 @@ def lejepa_forward(self, batch, stage, cfg):
     # This resolves the SIGReg/L_speed contradiction: the network can satisfy SIGReg
     # through high-velocity latent jumps precisely at physical events, while keeping
     # free-space trajectories tightly compressed.
-    delta_act  = batch['action'][:, 1:] - batch['action'][:, :-1]          # (B, T-1, A)
-    act_change = delta_act.norm(p=2, dim=-1).detach()                       # (B, T-1)
-    gate       = torch.exp(-act_change / sigma_act)                         # (B, T-1) ∈ (0,1]
-    lat_speed  = vel.norm(p=2, dim=-1)                                      # (B, T-1)
+    delta_act = batch['action'][:, 1:] - batch['action'][:, :-1]  # (B, T-1, A)
+    act_change = delta_act.norm(p=2, dim=-1).detach()  # (B, T-1)
+    gate = torch.exp(-act_change / sigma_act)  # (B, T-1) ∈ (0,1]
+    lat_speed = vel.norm(p=2, dim=-1)  # (B, T-1)
     output['agir_loss'] = (gate * lat_speed).mean()
 
     output['loss'] = (
         output['pred_loss']
-        + lambd       * output['sigreg_loss']
-        + lambd_curv  * output['curv_loss']
+        + lambd * output['sigreg_loss']
+        + lambd_curv * output['curv_loss']
         + lambd_speed * output['speed_loss']
-        + lambd_agir  * output['agir_loss']
+        + lambd_agir * output['agir_loss']
     )
 
     self.log_dict(
@@ -162,7 +168,7 @@ def run(cfg):
     ##########################
 
     run_dir = setup_run_dir(cfg)
-    pl_logger = build_wandb_logger(cfg, run_dir)
+    pl_logger = build_logger(cfg, run_dir)
 
     ckpt_dir = run_dir / 'lightning'
     last_ckpt = ckpt_dir / 'last.ckpt'
@@ -200,6 +206,7 @@ def run(cfg):
             every_n_epochs=cfg.checkpointing.every_n_epochs,
             probe_cfg=probe_cfg,
             device=cfg.get('device', 'cpu'),
+            pl_logger=pl_logger,
         ),
     ]
 
@@ -221,16 +228,10 @@ def run(cfg):
 
 
 def _run_post_training(cfg, model, pl_logger):
-    """Run CEM planning eval after training and log to W&B."""
+    """Run CEM planning eval after training and log results."""
     pt = cfg.get('post_training', {})
     if not pt:
         return
-
-    import wandb
-
-    def _wandb_log(metrics: dict):
-        if wandb.run is not None:
-            wandb.log(metrics)
 
     # ── CEM planning evaluation ─────────────────────────────────────────────
     if pt.get('run_eval', False):
@@ -239,62 +240,79 @@ def _run_post_training(cfg, model, pl_logger):
         from eval_wm import eval_model
 
         eval_cfg_raw = OmegaConf.to_container(pt.eval, resolve=True)
-        eval_cfg = OC.create({
-            'world': {
-                'env_name':          eval_cfg_raw['env_name'],
-                'num_envs':          eval_cfg_raw['num_envs'],
-                'max_episode_steps': eval_cfg_raw['max_episode_steps'],
-            },
-            'seed':        eval_cfg_raw['seed'],
-            'policy':      f"{cfg.output_model_name}/weights_epoch_{cfg.trainer.max_epochs:04d}.pt",
-            'objective':   eval_cfg_raw['objective'],
-            'solver':      eval_cfg_raw['solver'],
-            'plan_config': eval_cfg_raw['plan_config'],
-            'dataset':     {'keys_to_cache': eval_cfg_raw['keys_to_cache']},
-            'eval': {
-                'num_eval':           eval_cfg_raw['num_eval'],
-                'goal_offset_steps':  eval_cfg_raw['goal_offset_steps'],
-                'eval_budget':        eval_cfg_raw['eval_budget'],
-                'img_size':           cfg.img_size,
-                'dataset_name':       eval_cfg_raw['dataset_name'],
-                'callables':          eval_cfg_raw['callables'],
-            },
-            'device': cfg.device,
-            'bf16':   False,
-            'compile': False,
-            'output': {'filename': 'eval_results.txt'},
-        })
+        eval_cfg = OC.create(
+            {
+                'world': {
+                    'env_name': eval_cfg_raw['env_name'],
+                    'num_envs': eval_cfg_raw['num_envs'],
+                    'max_episode_steps': eval_cfg_raw['max_episode_steps'],
+                },
+                'seed': eval_cfg_raw['seed'],
+                'policy': f'{cfg.output_model_name}/weights_epoch_{cfg.trainer.max_epochs:04d}.pt',
+                'objective': eval_cfg_raw['objective'],
+                'solver': eval_cfg_raw['solver'],
+                'plan_config': eval_cfg_raw['plan_config'],
+                'dataset': {'keys_to_cache': eval_cfg_raw['keys_to_cache']},
+                'eval': {
+                    'num_eval': eval_cfg_raw['num_eval'],
+                    'goal_offset_steps': eval_cfg_raw['goal_offset_steps'],
+                    'eval_budget': eval_cfg_raw['eval_budget'],
+                    'img_size': cfg.img_size,
+                    'dataset_name': eval_cfg_raw['dataset_name'],
+                    'callables': eval_cfg_raw['callables'],
+                },
+                'device': cfg.device,
+                'bf16': False,
+                'compile': False,
+                'output': {'filename': 'eval_results.txt'},
+            }
+        )
 
-        video_dir = Path(swm.data.utils.get_cache_dir('checkpoints')) / cfg.output_model_name
+        video_dir = (
+            Path(swm.data.utils.get_cache_dir('checkpoints'))
+            / cfg.output_model_name
+        )
         eval_metrics = eval_model(eval_cfg, model=model)
 
         scalar_metrics = {
-            'eval/success_rate':    eval_metrics.get('success_rate', float('nan')),
-            'eval/evaluation_time': eval_metrics.get('evaluation_time', float('nan')),
+            'eval/success_rate': eval_metrics.get(
+                'success_rate', float('nan')
+            ),
+            'eval/evaluation_time': eval_metrics.get(
+                'evaluation_time', float('nan')
+            ),
         }
 
-        import wandb
-        if wandb.run is not None:
-            # Log scalars
-            wandb.log(scalar_metrics)
+        log_metrics(pl_logger, scalar_metrics)
+        logging.info(scalar_metrics)
+        logging.info(
+            f'Eval success_rate: {eval_metrics.get("success_rate"):.1f}%'
+        )
 
-            # Log rollout videos — cap at 10 to keep artifact size small
+        # Rollout videos — W&B only (native video artifact support)
+        from lightning.pytorch.loggers import WandbLogger
+
+        if isinstance(pl_logger, WandbLogger):
+            import wandb
+
             videos = sorted(video_dir.glob('env_*.mp4'))
             successes = eval_metrics.get('episode_successes', [])
             video_log = {}
             for i, vid_path in enumerate(videos[:10]):
                 success = bool(successes[i]) if i < len(successes) else None
-                label = 'success' if success else 'fail' if success is not None else 'unknown'
+                label = (
+                    'success'
+                    if success
+                    else 'fail'
+                    if success is not None
+                    else 'unknown'
+                )
                 video_log[f'eval/rollout_{i:02d}_{label}'] = wandb.Video(
                     str(vid_path), fps=10, format='mp4'
                 )
             if video_log:
                 wandb.log(video_log)
                 logging.info(f'Logged {len(video_log)} rollout videos to W&B')
-        else:
-            logging.info(scalar_metrics)
-
-        logging.info(f"Eval success_rate: {eval_metrics.get('success_rate'):.1f}%")
 
 
 if __name__ == '__main__':

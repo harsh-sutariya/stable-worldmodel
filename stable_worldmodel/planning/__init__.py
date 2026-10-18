@@ -14,6 +14,8 @@ from stable_worldmodel.planning.evaluator import (
 from stable_worldmodel.planning.objective import (
     ControlPenalty,
     GoalMSE,
+    QuasimetricCost,
+    QuasimetricHead,
     WeightedSum,
 )
 
@@ -56,6 +58,8 @@ __all__ = [
     'Objective',
     'PGDSolver',
     'PredictiveSamplingSolver',
+    'QuasimetricCost',
+    'QuasimetricHead',
     'ShootingCostEvaluator',
     'Solver',
     'WeightedSum',

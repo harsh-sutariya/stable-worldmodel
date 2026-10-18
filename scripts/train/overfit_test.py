@@ -26,15 +26,15 @@ from stable_worldmodel.wm.lewm import LeWM
 from stable_worldmodel.wm.lewm.module import Embedder, MLP, Predictor
 
 # ── hyperparams ───────────────────────────────────────────────────────────────
-IMG_SIZE = 56      # 56/14 = 4 → 4×4 = 16 patches; small enough to be fast on CPU
+IMG_SIZE = 56  # 56/14 = 4 → 4×4 = 16 patches; small enough to be fast on CPU
 PATCH_SIZE = 14
-EMBED_DIM = 64     # projector output dim (kept small for speed)
-HISTORY_SIZE = 3   # matches lewm.yaml wm.history_size
-NUM_PREDS = 1      # matches lewm.yaml wm.num_preds
-ACTION_DIM = 2     # PushT action space
+EMBED_DIM = 64  # projector output dim (kept small for speed)
+HISTORY_SIZE = 3  # matches lewm.yaml wm.history_size
+NUM_PREDS = 1  # matches lewm.yaml wm.num_preds
+ACTION_DIM = 2  # PushT action space
 N_STEPS = 100
 LR = 1e-3
-CONVERGENCE_RATIO = 0.10   # final loss must be < 10% of initial to pass
+CONVERGENCE_RATIO = 0.10  # final loss must be < 10% of initial to pass
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -49,7 +49,7 @@ def _pick_device() -> torch.device:
 def _make_batch(device: torch.device) -> dict:
     """Single fixed batch used identically for every training step."""
     torch.manual_seed(42)
-    T = HISTORY_SIZE + NUM_PREDS   # 4
+    T = HISTORY_SIZE + NUM_PREDS  # 4
     return {
         'pixels': torch.rand(1, T, 3, IMG_SIZE, IMG_SIZE, device=device),
         'action': torch.rand(1, T, ACTION_DIM, device=device),
@@ -96,14 +96,14 @@ def _build_model(device: torch.device) -> LeWM:
 def _forward(model: LeWM, batch: dict) -> torch.Tensor:
     """Replicates lejepa_forward from lewm.py exactly."""
     output = model.encode(batch)
-    emb = output['emb']           # (B, T, D)
-    act_emb = output['act_emb']   # (B, T, D)
+    emb = output['emb']  # (B, T, D)
+    act_emb = output['act_emb']  # (B, T, D)
 
-    ctx_emb = emb[:, :HISTORY_SIZE]       # (B, 3, D)
-    ctx_act = act_emb[:, :HISTORY_SIZE]   # (B, 3, D)
-    tgt_emb = emb[:, NUM_PREDS:]          # (B, 3, D)  ← emb at t+1..T
+    ctx_emb = emb[:, :HISTORY_SIZE]  # (B, 3, D)
+    ctx_act = act_emb[:, :HISTORY_SIZE]  # (B, 3, D)
+    tgt_emb = emb[:, NUM_PREDS:]  # (B, 3, D)  ← emb at t+1..T
 
-    pred_emb = model.predict(ctx_emb, ctx_act)   # (B, 3, D)
+    pred_emb = model.predict(ctx_emb, ctx_act)  # (B, 3, D)
     return (pred_emb - tgt_emb).pow(2).mean()
 
 
@@ -117,7 +117,9 @@ def _is_adaln_gated(name: str) -> bool:
     After the first optimizer step W becomes non-zero and all these params
     receive proper gradients.
     """
-    if 'predictor.transformer.layers' in name and ('.attn.' in name or '.mlp.' in name):
+    if 'predictor.transformer.layers' in name and (
+        '.attn.' in name or '.mlp.' in name
+    ):
         return True
     if name.startswith('action_encoder.'):
         return True
@@ -143,7 +145,9 @@ def _check_gradients(model: LeWM, step: int) -> tuple[bool, list[str]]:
 def main():
     device = _pick_device()
     logging.info(f'Device        : {device}')
-    logging.info(f'Image size    : {IMG_SIZE}×{IMG_SIZE}  ({(IMG_SIZE//PATCH_SIZE)**2} patches)')
+    logging.info(
+        f'Image size    : {IMG_SIZE}×{IMG_SIZE}  ({(IMG_SIZE // PATCH_SIZE) ** 2} patches)'
+    )
 
     batch = _make_batch(device)
     model = _build_model(device)
@@ -160,7 +164,9 @@ def main():
         opt.zero_grad()
         loss = _forward(model, batch)
 
-        assert torch.isfinite(loss), f'step {step}: loss is {loss.item()} (NaN or Inf)'
+        assert torch.isfinite(loss), (
+            f'step {step}: loss is {loss.item()} (NaN or Inf)'
+        )
         loss.backward()
 
         # Gradient check: step 0 exempts AdaLN-gated params (gate=0 by init);
@@ -174,12 +180,14 @@ def main():
                 )
             if step == 0:
                 logging.info(
-                    f'Gradient check (step 0): PASSED '
-                    f'— encoder/projector/action_encoder/pred_proj/adaLN all have grads; '
-                    f'predictor attn/mlp zero by AdaLN-zero init (expected)'
+                    'Gradient check (step 0): PASSED '
+                    '— encoder/projector/action_encoder/pred_proj/adaLN all have grads; '
+                    'predictor attn/mlp zero by AdaLN-zero init (expected)'
                 )
             else:
-                logging.info(f'Gradient check (step 1): PASSED — all {n_params:,} params have grads after gate open')
+                logging.info(
+                    f'Gradient check (step 1): PASSED — all {n_params:,} params have grads after gate open'
+                )
                 logging.info('')
 
         opt.step()
@@ -194,14 +202,18 @@ def main():
 
     logging.info('')
     logging.info(f'Initial loss  : {losses[0]:.6f}')
-    logging.info(f'Final loss    : {losses[-1]:.6f}  (×{ratio:.4f} of initial)')
+    logging.info(
+        f'Final loss    : {losses[-1]:.6f}  (×{ratio:.4f} of initial)'
+    )
 
     assert converged, (
         f'Loss did not converge: {losses[0]:.6f} → {losses[-1]:.6f} '
         f'(ratio {ratio:.3f} >= {CONVERGENCE_RATIO})'
     )
 
-    logging.info(f'Convergence   : PASSED (ratio {ratio:.4f} < {CONVERGENCE_RATIO})')
+    logging.info(
+        f'Convergence   : PASSED (ratio {ratio:.4f} < {CONVERGENCE_RATIO})'
+    )
     logging.info('')
     logging.info('══════  Overfit test PASSED  ══════')
 
