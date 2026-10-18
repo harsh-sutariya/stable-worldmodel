@@ -58,10 +58,11 @@ import numpy as np
 import gymnasium as gym
 from dm_control import mjcf
 
-from ogbench.locomaze.maze import make_maze_env
 
 from stable_worldmodel import spaces as swm_spaces
+from stable_worldmodel.envs.ogbench.umaze import build_make_maze_env
 
+make_maze_env = build_make_maze_env()
 
 DEFAULT_VARIATIONS = ()
 """Variation keys sampled on every reset even when the caller does not
@@ -274,7 +275,9 @@ class MazeEnv(gym.Wrapper):
         # Mirror eval callables onto the inner env for the same reason:
         # _apply_callables calls these on env.unwrapped, which bypasses MazeEnv.
         _inner = self.env.unwrapped
-        _inner._set_state = lambda xy: _inner.set_xy(np.asarray(xy, np.float64))
+        _inner._set_state = lambda xy: _inner.set_xy(
+            np.asarray(xy, np.float64)
+        )
         _inner._set_goal_state = lambda goal_xy: _inner.set_goal(
             goal_xy=np.asarray(goal_xy, np.float64)
         )
