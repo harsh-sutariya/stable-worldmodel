@@ -92,6 +92,28 @@ frames as pixels, so `WorldModelPolicy.history_keys` must cover every extra
 encoder input (e.g. `('pixels', 'proprio')`) — otherwise the fused
 concatenation is malformed.
 
+### Learned goal distance (opt-in)
+
+`GoalMSE` is the default cost. [`QuasimetricCost`][stable_worldmodel.planning.QuasimetricCost]
+replaces the squared L2 with a small head `d(z, z_goal)` trained on the frozen
+embeddings of the same world model. It helps on route-finding tasks (U-maze,
+TwoRoom) and can hurt on contact-rich manipulation (PushT, Cube), where raw L2
+resolves nearby states better, so it is not the default.
+
+```bash
+# 1. train the head on frozen embeddings (use the model's training img size / frameskip)
+uv run python scripts/train/train_quasimetric.py \
+    --model lewm_agir_umaze/weights_epoch_0010.pt \
+    --dataset ogb_pointmaze_umaze.lance --output qm_agir_umaze \
+    --img-size 64 --frameskip 2
+
+# 2. plan with it: swap the objective on any env config
+uv run python scripts/plan/eval_wm.py --config-name ogb_umaze \
+    objective=quasimetric objective.ckpt_path=qm_agir_umaze/qm_head.pt
+```
+
+A relative `ckpt_path` is resolved under the checkpoints cache, like `policy`.
+
 ### Writing a custom objective
 
 An objective is any callable mapping a populated `info_dict` to a
@@ -139,6 +161,18 @@ class SmoothnessPenalty(nn.Module):
         show_source: false
 
 ::: stable_worldmodel.planning.ControlPenalty
+    options:
+        heading_level: 3
+        members: false
+        show_source: false
+
+::: stable_worldmodel.planning.QuasimetricCost
+    options:
+        heading_level: 3
+        members: false
+        show_source: false
+
+::: stable_worldmodel.planning.QuasimetricHead
     options:
         heading_level: 3
         members: false

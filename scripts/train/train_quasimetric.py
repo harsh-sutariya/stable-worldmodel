@@ -21,7 +21,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from torchvision.transforms import v2 as transforms
@@ -30,39 +29,23 @@ from tqdm import tqdm
 import stable_pretraining as spt
 import stable_worldmodel as swm
 from stable_worldmodel.data import get_cache_dir
+from stable_worldmodel.planning import QuasimetricHead
 from stable_worldmodel.wm.utils import load_pretrained
 
-BATCH_SIZE  = 512
-HIDDEN_DIM  = 256
-LR          = 3e-4
+BATCH_SIZE = 512
+HIDDEN_DIM = 256
+LR = 3e-4
 
 
 def make_transform(img_size: int):
-    return transforms.Compose([
-        transforms.ToImage(),
-        transforms.ToDtype(torch.float32, scale=True),
-        transforms.Normalize(**spt.data.dataset_stats.ImageNet),
-        transforms.Resize(size=img_size),
-    ])
-
-
-class QuasimetricHead(nn.Module):
-    """MLP that predicts step-distance between two latent embeddings."""
-
-    def __init__(self, emb_dim: int, hidden_dim: int = HIDDEN_DIM):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(2 * emb_dim, hidden_dim),
-            nn.ELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ELU(),
-            nn.Linear(hidden_dim, 1),
-            nn.Softplus(),  # ensures positive output
-        )
-
-    def forward(self, z_curr: torch.Tensor, z_goal: torch.Tensor) -> torch.Tensor:
-        """z_curr, z_goal: (B, D) → scalar distances (B,)"""
-        return self.net(torch.cat([z_curr, z_goal], dim=-1)).squeeze(-1)
+    return transforms.Compose(
+        [
+            transforms.ToImage(),
+            transforms.ToDtype(torch.float32, scale=True),
+            transforms.Normalize(**spt.data.dataset_stats.ImageNet),
+            transforms.Resize(size=img_size),
+        ]
+    )
 
 
 class PairDataset(Dataset):
@@ -70,7 +53,7 @@ class PairDataset(Dataset):
 
     def __init__(self, z_pairs: np.ndarray, labels: np.ndarray):
         self.z_pairs = torch.from_numpy(z_pairs).float()  # (N, 2, D)
-        self.labels  = torch.from_numpy(labels).float()   # (N,)
+        self.labels = torch.from_numpy(labels).float()  # (N,)
 
     def __len__(self):
         return len(self.labels)
@@ -79,12 +62,18 @@ class PairDataset(Dataset):
         return self.z_pairs[idx, 0], self.z_pairs[idx, 1], self.labels[idx]
 
 
-def encode_episode(model, transform, frames_hwc: np.ndarray, act_dim: int) -> np.ndarray:
+def encode_episode(
+    model, transform, frames_hwc: np.ndarray, act_dim: int
+) -> np.ndarray:
     """Encode (T, H, W, C) uint8 → (T, D) numpy embeddings."""
-    ts = torch.stack([transform(f) for f in frames_hwc]).unsqueeze(0)  # (1,T,C,H,W)
-    T  = len(frames_hwc)
+    ts = torch.stack([transform(f) for f in frames_hwc]).unsqueeze(
+        0
+    )  # (1,T,C,H,W)
+    T = len(frames_hwc)
     with torch.no_grad():
-        info = model.encode({'pixels': ts, 'action': torch.zeros(1, T, act_dim)})
+        info = model.encode(
+            {'pixels': ts, 'action': torch.zeros(1, T, act_dim)}
+        )
     return info['emb'][0].numpy()  # (T, D)
 
 
@@ -102,7 +91,9 @@ def build_pairs(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Build (z_i, z_j, label) training pairs from the dataset."""
     uniq_eps = np.unique(ep_col)
-    selected = rng.choice(uniq_eps, size=min(max_eps, len(uniq_eps)), replace=False)
+    selected = rng.choice(
+        uniq_eps, size=min(max_eps, len(uniq_eps)), replace=False
+    )
 
     all_pairs, all_labels = [], []
 
@@ -120,7 +111,9 @@ def build_pairs(
         chunk = ds.load_chunk(
             np.array([ep_id]), np.array([s]), np.array([s + span])
         )[0]
-        px = chunk['pixels'][::frameskip].permute(0, 2, 3, 1).numpy()  # (T, H,W,C)
+        px = (
+            chunk['pixels'][::frameskip].permute(0, 2, 3, 1).numpy()
+        )  # (T, H,W,C)
         act_dim = chunk['action'].shape[-1] * frameskip
         embs = encode_episode(model, transform, px, act_dim)  # (T, D)
         ep_embs[ep_id] = embs
@@ -148,12 +141,12 @@ def build_pairs(
         all_labels.append(float(max_dist + 5))
 
     z_pairs = np.array(all_pairs, dtype=np.float32)  # (N, 2, D)
-    labels  = np.array(all_labels, dtype=np.float32)  # (N,)
+    labels = np.array(all_labels, dtype=np.float32)  # (N,)
     return z_pairs, labels
 
 
 def train(args):
-    rng   = np.random.default_rng(42)
+    rng = np.random.default_rng(42)
     device = 'cpu'
 
     print(f'Loading model: {args.model}')
@@ -162,20 +155,26 @@ def train(args):
     model.interpolate_pos_encoding = True
 
     print(f'Loading dataset: {args.dataset}')
-    ds       = swm.data.load_dataset(args.dataset)
-    ep_col   = ds.get_col_data('episode_idx')
+    ds = swm.data.load_dataset(args.dataset)
+    ep_col = ds.get_col_data('episode_idx')
     step_col = ds.get_col_data('step_idx')
 
     print('Building training pairs…')
     neg_label = args.max_dist + 5
     z_pairs, labels = build_pairs(
-        model, ds, ep_col, step_col, rng,
+        model,
+        ds,
+        ep_col,
+        step_col,
+        rng,
         transform=make_transform(args.img_size),
         frameskip=args.frameskip,
         max_dist=args.max_dist,
     )
     emb_dim = z_pairs.shape[-1]
-    print(f'  {len(labels)} pairs  (pos: {(labels < neg_label).sum()}, neg: {(labels >= neg_label).sum()})')
+    print(
+        f'  {len(labels)} pairs  (pos: {(labels < neg_label).sum()}, neg: {(labels >= neg_label).sum()})'
+    )
 
     # Normalise labels to [0, 1] range for stable training
     label_scale = float(neg_label)
@@ -189,11 +188,13 @@ def train(args):
 
     tr_ds = PairDataset(z_pairs[tr_idx], labels_norm[tr_idx])
     va_ds = PairDataset(z_pairs[va_idx], labels_norm[va_idx])
-    tr_dl = DataLoader(tr_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+    tr_dl = DataLoader(
+        tr_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=True
+    )
     va_dl = DataLoader(va_ds, batch_size=BATCH_SIZE)
 
     head = QuasimetricHead(emb_dim, HIDDEN_DIM).to(device)
-    opt  = torch.optim.Adam(head.parameters(), lr=LR)
+    opt = torch.optim.Adam(head.parameters(), lr=LR)
 
     best_val, best_state = float('inf'), None
     for epoch in range(args.epochs):
@@ -217,7 +218,9 @@ def train(args):
         va_loss /= len(va_dl)
         tr_loss /= len(tr_dl)
 
-        print(f'Epoch {epoch+1:>3}/{args.epochs}  train={tr_loss:.4f}  val={va_loss:.4f}')
+        print(
+            f'Epoch {epoch + 1:>3}/{args.epochs}  train={tr_loss:.4f}  val={va_loss:.4f}'
+        )
         if va_loss < best_val:
             best_val = va_loss
             best_state = {k: v.clone() for k, v in head.state_dict().items()}
@@ -226,8 +229,15 @@ def train(args):
     ckpt_dir = Path(get_cache_dir(sub_folder='checkpoints')) / args.output
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = ckpt_dir / 'qm_head.pt'
-    torch.save({'state_dict': best_state, 'emb_dim': emb_dim, 'hidden_dim': HIDDEN_DIM,
-                'label_scale': label_scale}, ckpt_path)
+    torch.save(
+        {
+            'state_dict': best_state,
+            'emb_dim': emb_dim,
+            'hidden_dim': HIDDEN_DIM,
+            'label_scale': label_scale,
+        },
+        ckpt_path,
+    )
     print(f'Saved to {ckpt_path}  (best_val={best_val:.4f})')
 
     # Quick sanity: Pearson r between predicted and true distance on val set
@@ -242,16 +252,32 @@ def train(args):
     trues = np.concatenate(trues)
     r = np.corrcoef(trues, preds)[0, 1]
     print(f'Val Pearson r(true_dist, pred_dist) = {r:.4f}')
-    (ckpt_dir / 'qm_results.json').write_text(json.dumps({'best_val': best_val, 'pearson_r': r}))
+    (ckpt_dir / 'qm_results.json').write_text(
+        json.dumps({'best_val': best_val, 'pearson_r': r})
+    )
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model',   required=True, help='LeWM checkpoint name')
+    parser.add_argument('--model', required=True, help='LeWM checkpoint name')
     parser.add_argument('--dataset', required=True, help='Dataset name')
-    parser.add_argument('--output',  required=True, help='Output checkpoint name')
-    parser.add_argument('--epochs',  type=int, default=20)
-    parser.add_argument('--img-size',  type=int, default=64, help='training image resolution')
-    parser.add_argument('--frameskip', type=int, default=2,  help='training frameskip (raw steps per model step)')
-    parser.add_argument('--max-dist',  type=int, default=20, help='max positive-pair gap in model steps')
+    parser.add_argument(
+        '--output', required=True, help='Output checkpoint name'
+    )
+    parser.add_argument('--epochs', type=int, default=20)
+    parser.add_argument(
+        '--img-size', type=int, default=64, help='training image resolution'
+    )
+    parser.add_argument(
+        '--frameskip',
+        type=int,
+        default=2,
+        help='training frameskip (raw steps per model step)',
+    )
+    parser.add_argument(
+        '--max-dist',
+        type=int,
+        default=20,
+        help='max positive-pair gap in model steps',
+    )
     train(parser.parse_args())

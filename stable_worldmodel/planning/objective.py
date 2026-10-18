@@ -8,17 +8,24 @@ the world model. The ``Objective`` protocol itself lives in
 :mod:`stable_worldmodel.protocols`; this module holds concrete objectives.
 """
 
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from stable_worldmodel.data import get_cache_dir
 from stable_worldmodel.protocols import Objective
 
 
-class _QuasimetricMLP(nn.Module):
-    """Internal MLP for QuasimetricCost — matches train_quasimetric.py architecture."""
+class QuasimetricHead(nn.Module):
+    """MLP regressing the step distance between two latent embeddings.
 
-    def __init__(self, emb_dim: int, hidden_dim: int):
+    Shared by ``scripts/train/train_quasimetric.py`` (training) and
+    :class:`QuasimetricCost` (planning) so the two cannot drift apart.
+    """
+
+    def __init__(self, emb_dim: int, hidden_dim: int = 256) -> None:
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(2 * emb_dim, hidden_dim),
@@ -29,7 +36,10 @@ class _QuasimetricMLP(nn.Module):
             nn.Softplus(),
         )
 
-    def forward(self, z_curr: torch.Tensor, z_goal: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, z_curr: torch.Tensor, z_goal: torch.Tensor
+    ) -> torch.Tensor:
+        """``z_curr``, ``z_goal``: ``(N, D)`` -> distances ``(N,)``."""
         return self.net(torch.cat([z_curr, z_goal], dim=-1)).squeeze(-1)
 
 
@@ -118,19 +128,23 @@ class ControlPenalty(nn.Module):
 
 
 class QuasimetricCost(nn.Module):
-    """Learned quasimetric distance as CEM cost (TD-JEPA style).
+    """Learned distance to the goal as the planning cost (TD-JEPA style).
 
-    Replaces raw GoalMSE L2 with a trained distance head
-    d(z_curr, z_goal) → scalar, loaded from a checkpoint produced by
-    ``scripts/train/train_quasimetric.py``.
+    Scores each candidate with ``d(z_pred, z_goal)`` from a
+    :class:`QuasimetricHead` trained on frozen embeddings of the *same* world
+    model (see ``scripts/train/train_quasimetric.py``). Same interface as
+    :class:`GoalMSE`: reads ``predicted_emb`` ``(B, S, T, D)`` and
+    ``goal_emb`` ``(B, T_goal, D)``, returns ``(B, S)``.
 
-    Interface is identical to GoalMSE: reads ``predicted_emb`` (B, S, T, D)
-    and ``goal_emb`` (B, T_goal, D) from ``info_dict``, returns (B, S).
+    Raw L2 (:class:`GoalMSE`) remains the default objective; this one is
+    opt-in and helps on route-finding tasks (mazes, TwoRoom) but can hurt on
+    contact-rich manipulation (PushT, Cube).
 
     Args:
-        ckpt_path: Absolute path to the ``qm_head.pt`` checkpoint file.
-        pred_key: Key in info_dict for rollout predictions.
-        goal_key: Key in info_dict for goal embedding.
+        ckpt_path: ``qm_head.pt`` written by the trainer. A relative path is
+            resolved under the checkpoints cache directory, like ``policy``.
+        pred_key: ``info_dict`` key holding the rollout predictions.
+        goal_key: ``info_dict`` key holding the goal embedding.
     """
 
     def __init__(
@@ -143,35 +157,30 @@ class QuasimetricCost(nn.Module):
         self.pred_key = pred_key
         self.goal_key = goal_key
 
-        ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True)
-        emb_dim    = ckpt['emb_dim']
-        hidden_dim = ckpt['hidden_dim']
-        self.label_scale = float(ckpt['label_scale'])
+        path = Path(ckpt_path).expanduser()
+        if not path.is_absolute() and not path.exists():
+            path = get_cache_dir(sub_folder='checkpoints') / path
+        ckpt = torch.load(path, map_location='cpu', weights_only=True)
 
-        self.head = _QuasimetricMLP(emb_dim, hidden_dim)
+        self.head = QuasimetricHead(ckpt['emb_dim'], ckpt['hidden_dim'])
         self.head.load_state_dict(ckpt['state_dict'])
         self.head.requires_grad_(False)
 
     def forward(self, info_dict: dict) -> torch.Tensor:
-        pred_emb = info_dict[self.pred_key]   # (B, S, T, D)
-        goal_emb = info_dict[self.goal_key]   # (B, T_goal, D)
+        pred_emb = info_dict[self.pred_key]  # (B, S, T, D)
+        goal_emb = info_dict[self.goal_key]  # (B, T_goal, D)
 
-        device = pred_emb.device
-        if next(self.head.parameters()).device != device:
-            self.head = self.head.to(device)
+        # Planning moves the world model to the accelerator after this
+        # objective is built, so follow the inputs' device lazily.
+        if next(self.head.parameters()).device != pred_emb.device:
+            self.head.to(pred_emb.device)
 
         B, S = pred_emb.shape[:2]
-        z_pred = pred_emb[:, :, -1, :]        # (B, S, D) — last predicted step
-        z_goal = goal_emb[:, -1, :]           # (B, D)    — last goal frame
-
-        # Flatten to (B*S, D) for batched MLP
-        z_pred_flat = z_pred.reshape(B * S, -1)
-        z_goal_flat = z_goal.unsqueeze(1).expand(B, S, -1).reshape(B * S, -1)
+        z_pred = pred_emb[:, :, -1].reshape(B * S, -1)  # last predicted step
+        z_goal = goal_emb[:, None, -1].expand(B, S, -1).reshape(B * S, -1)
 
         with torch.no_grad():
-            dist_flat = self.head(z_pred_flat, z_goal_flat)  # (B*S,)
-
-        return dist_flat.reshape(B, S)
+            return self.head(z_pred, z_goal).reshape(B, S)
 
 
 class WeightedSum(nn.Module):
