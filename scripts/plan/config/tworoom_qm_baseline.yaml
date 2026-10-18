@@ -1,0 +1,12 @@
+defaults:
+  - tworoom
+  - override objective: quasimetric
+  - _self_
+
+policy: lewm_tworoom/weights_epoch_0010.pt
+
+objective:
+  ckpt_path: ${oc.env:HOME}/.stable_worldmodel/checkpoints/qm_baseline_tworoom/qm_head.pt
+
+output:
+  filename: tworoom_qm_baseline_results.txt
