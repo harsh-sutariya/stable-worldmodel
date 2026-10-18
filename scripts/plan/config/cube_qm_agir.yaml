@@ -1,0 +1,12 @@
+defaults:
+  - cube
+  - override objective: quasimetric
+  - _self_
+
+policy: lewm_agir_cube/weights_epoch_0010.pt
+
+objective:
+  ckpt_path: ${oc.env:HOME}/.stable_worldmodel/checkpoints/qm_agir_cube/qm_head.pt
+
+output:
+  filename: ogb_cube_qm_agir_results.txt

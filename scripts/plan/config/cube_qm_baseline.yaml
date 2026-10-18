@@ -1,0 +1,12 @@
+defaults:
+  - cube
+  - override objective: quasimetric
+  - _self_
+
+policy: lewm_cube/weights_epoch_0010.pt
+
+objective:
+  ckpt_path: ${oc.env:HOME}/.stable_worldmodel/checkpoints/qm_baseline_cube/qm_head.pt
+
+output:
+  filename: ogb_cube_qm_baseline_results.txt
