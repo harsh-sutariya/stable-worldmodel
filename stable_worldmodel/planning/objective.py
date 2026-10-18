@@ -15,6 +15,24 @@ import torch.nn.functional as F
 from stable_worldmodel.protocols import Objective
 
 
+class _QuasimetricMLP(nn.Module):
+    """Internal MLP for QuasimetricCost — matches train_quasimetric.py architecture."""
+
+    def __init__(self, emb_dim: int, hidden_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2 * emb_dim, hidden_dim),
+            nn.ELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ELU(),
+            nn.Linear(hidden_dim, 1),
+            nn.Softplus(),
+        )
+
+    def forward(self, z_curr: torch.Tensor, z_goal: torch.Tensor) -> torch.Tensor:
+        return self.net(torch.cat([z_curr, z_goal], dim=-1)).squeeze(-1)
+
+
 class GoalMSE(nn.Module):
     """Last-step MSE between predicted and goal embeddings.
 
@@ -97,6 +115,63 @@ class ControlPenalty(nn.Module):
     def forward(self, info_dict: dict) -> torch.Tensor:
         actions = info_dict[self.action_key]
         return actions.pow(2).sum(dim=tuple(range(2, actions.ndim)))
+
+
+class QuasimetricCost(nn.Module):
+    """Learned quasimetric distance as CEM cost (TD-JEPA style).
+
+    Replaces raw GoalMSE L2 with a trained distance head
+    d(z_curr, z_goal) → scalar, loaded from a checkpoint produced by
+    ``scripts/train/train_quasimetric.py``.
+
+    Interface is identical to GoalMSE: reads ``predicted_emb`` (B, S, T, D)
+    and ``goal_emb`` (B, T_goal, D) from ``info_dict``, returns (B, S).
+
+    Args:
+        ckpt_path: Absolute path to the ``qm_head.pt`` checkpoint file.
+        pred_key: Key in info_dict for rollout predictions.
+        goal_key: Key in info_dict for goal embedding.
+    """
+
+    def __init__(
+        self,
+        ckpt_path: str,
+        pred_key: str = 'predicted_emb',
+        goal_key: str = 'goal_emb',
+    ) -> None:
+        super().__init__()
+        self.pred_key = pred_key
+        self.goal_key = goal_key
+
+        ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True)
+        emb_dim    = ckpt['emb_dim']
+        hidden_dim = ckpt['hidden_dim']
+        self.label_scale = float(ckpt['label_scale'])
+
+        self.head = _QuasimetricMLP(emb_dim, hidden_dim)
+        self.head.load_state_dict(ckpt['state_dict'])
+        self.head.requires_grad_(False)
+
+    def forward(self, info_dict: dict) -> torch.Tensor:
+        pred_emb = info_dict[self.pred_key]   # (B, S, T, D)
+        goal_emb = info_dict[self.goal_key]   # (B, T_goal, D)
+
+        device = pred_emb.device
+        if next(self.head.parameters()).device != device:
+            self.head = self.head.to(device)
+
+        B, S = pred_emb.shape[:2]
+        z_pred = pred_emb[:, :, -1, :]        # (B, S, D) — last predicted step
+        z_goal = goal_emb[:, -1, :]           # (B, D)    — last goal frame
+
+        # Flatten to (B*S, D) for batched MLP
+        z_pred_flat = z_pred.reshape(B * S, -1)
+        z_goal_flat = z_goal.unsqueeze(1).expand(B, S, -1).reshape(B * S, -1)
+
+        with torch.no_grad():
+            dist_flat = self.head(z_pred_flat, z_goal_flat)  # (B*S,)
+
+        return dist_flat.reshape(B, S)
 
 
 class WeightedSum(nn.Module):
