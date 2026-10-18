@@ -35,6 +35,7 @@ eval:
   goal_offset_steps: 50
   eval_budget: 200
   img_size: 64
+  render_size: 64   # native env/dataset resolution
   dataset_name: ogb_pointmaze_large.lance
   callables:
     - method: _set_state
