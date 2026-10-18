@@ -1,0 +1,18 @@
+defaults:
+  - pusht
+  - override objective: quasimetric
+  - _self_
+
+world:
+  max_episode_steps: 100
+
+policy: lewm_agir_pusht/weights_epoch_0010.pt
+
+objective:
+  ckpt_path: ${oc.env:HOME}/.stable_worldmodel/checkpoints/qm_agir_pusht/qm_head.pt
+
+eval:
+  img_size: 56
+
+output:
+  filename: pusht_qm_agir_results.txt
