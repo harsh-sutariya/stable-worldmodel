@@ -1,6 +1,5 @@
 """Script to evaluate a World Model using MPC on a dataset of episodes."""
 
-import os
 import time
 from pathlib import Path
 
@@ -82,7 +81,7 @@ def eval_model(cfg: DictConfig, model=None) -> dict:
     img_dtype = torch.bfloat16 if cfg.get('bf16', False) else torch.float32
     transform = {
         'pixels': img_transform(cfg, img_dtype),
-        'goal':   img_transform(cfg, img_dtype),
+        'goal': img_transform(cfg, img_dtype),
     }
 
     dataset = get_dataset(cfg, cfg.eval.dataset_name)
@@ -97,15 +96,15 @@ def eval_model(cfg: DictConfig, model=None) -> dict:
         if col in ['pixels']:
             continue
         processor = preprocessing.StandardScaler()
-        col_data  = dataset.get_col_data(col)
-        col_data  = col_data[~np.isnan(col_data).any(axis=1)]
+        col_data = dataset.get_col_data(col)
+        col_data = col_data[~np.isnan(col_data).any(axis=1)]
         processor.fit(col_data)
         process[col] = processor
         if col != 'action':
             process[f'goal_{col}'] = process[col]
 
     policy_name = cfg.get('policy', 'random')
-    device      = cfg.get('device', 'cpu')
+    device = cfg.get('device', 'cpu')
 
     if policy_name != 'random':
         if model is None:
@@ -116,8 +115,14 @@ def eval_model(cfg: DictConfig, model=None) -> dict:
         model.requires_grad_(False)
         model.interpolate_pos_encoding = True
         if cfg.get('compile', False):
-            encoder_attr = 'backbone' if hasattr(model, 'backbone') else 'encoder'
-            setattr(model, encoder_attr, torch.compile(getattr(model, encoder_attr)))
+            encoder_attr = (
+                'backbone' if hasattr(model, 'backbone') else 'encoder'
+            )
+            setattr(
+                model,
+                encoder_attr,
+                torch.compile(getattr(model, encoder_attr)),
+            )
             model.predictor = torch.compile(model.predictor)
         config = swm.PlanConfig(**cfg.plan_config)
         objective = hydra.utils.instantiate(cfg.objective)
@@ -130,7 +135,9 @@ def eval_model(cfg: DictConfig, model=None) -> dict:
         policy = swm.policy.RandomPolicy()
 
     results_path = (
-        Path(swm.data.utils.get_cache_dir(sub_folder='checkpoints'), cfg.policy).parent
+        Path(
+            swm.data.utils.get_cache_dir(sub_folder='checkpoints'), cfg.policy
+        ).parent
         if policy_name != 'random'
         else Path(__file__).parent
     )
@@ -146,7 +153,7 @@ def eval_model(cfg: DictConfig, model=None) -> dict:
     max_start_per_row = np.array(
         [max_start_idx_dict[ep_id] for ep_id in dataset.get_col_data(col_name)]
     )
-    valid_mask    = dataset.get_col_data('step_idx') <= max_start_per_row
+    valid_mask = dataset.get_col_data('step_idx') <= max_start_per_row
     valid_indices = np.nonzero(valid_mask)[0]
     print(valid_mask.sum(), 'valid starting points found for evaluation.')
 
@@ -165,19 +172,23 @@ def eval_model(cfg: DictConfig, model=None) -> dict:
     eval_start_idx = dataset.get_col_data('step_idx')[random_episode_indices]
 
     if len(eval_episodes) < cfg.eval.num_eval:
-        raise ValueError('Not enough episodes with sufficient length for evaluation.')
+        raise ValueError(
+            'Not enough episodes with sufficient length for evaluation.'
+        )
 
     world.set_policy(policy)
     results_path.mkdir(parents=True, exist_ok=True)
     print(f'[eval] saving videos to {results_path.resolve()}')
 
-    use_bf16       = cfg.get('bf16', False)
+    use_bf16 = cfg.get('bf16', False)
     autocast_device = device if device == 'cuda' else 'cpu'
 
     callables = OmegaConf.to_container(cfg.eval.get('callables'), resolve=True)
 
     start_time = time.time()
-    with torch.autocast(device_type=autocast_device, dtype=torch.bfloat16, enabled=use_bf16):
+    with torch.autocast(
+        device_type=autocast_device, dtype=torch.bfloat16, enabled=use_bf16
+    ):
         metrics = world.evaluate(
             dataset=dataset,
             start_steps=eval_start_idx.tolist(),
@@ -200,7 +211,9 @@ def run(cfg: DictConfig):
     metrics = eval_model(cfg)
 
     results_path = (
-        Path(swm.data.utils.get_cache_dir(sub_folder='checkpoints'), cfg.policy).parent
+        Path(
+            swm.data.utils.get_cache_dir(sub_folder='checkpoints'), cfg.policy
+        ).parent
         if cfg.get('policy', 'random') != 'random'
         else Path(__file__).parent
     )

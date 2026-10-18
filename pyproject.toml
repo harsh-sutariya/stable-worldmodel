@@ -115,6 +115,10 @@ source-exclude = [
 line-length = 79
 indent-width = 4
 
+[tool.ruff.lint.per-file-ignores]
+# Scripts adjust sys.path before importing sibling modules.
+"scripts/**" = ["E402"]
+
 [tool.ruff.format]
 indent-style = "space"
 quote-style = "single"

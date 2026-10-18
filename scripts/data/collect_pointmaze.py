@@ -43,12 +43,16 @@ class PointMazeOraclePolicy(BasePolicy):
         for i, env_wrapper in enumerate(self.env.envs):
             base_env = env_wrapper.unwrapped
             cur_xy = np.array(base_env.get_xy(), dtype=np.float64)
-            goal_xy = np.array(base_env.cur_task_info['goal_xy'], dtype=np.float64)
+            goal_xy = np.array(
+                base_env.cur_task_info['goal_xy'], dtype=np.float64
+            )
             subgoal_xy, _ = base_env.get_oracle_subgoal(cur_xy, goal_xy)
             direction = np.array(subgoal_xy, dtype=np.float64) - cur_xy
             dist = np.linalg.norm(direction)
             if dist > 1e-8:
-                actions[i] = np.clip(direction / dist, -1.0, 1.0).astype(np.float32)
+                actions[i] = np.clip(direction / dist, -1.0, 1.0).astype(
+                    np.float32
+                )
 
         return actions
 
@@ -76,7 +80,9 @@ def collect_to_memory(world, episodes, seed):
 
     def record_xy(idxs):
         for i in idxs:
-            xy = np.array(world.envs.envs[i].unwrapped.get_xy(), dtype=np.float32)
+            xy = np.array(
+                world.envs.envs[i].unwrapped.get_xy(), dtype=np.float32
+            )
             buffers[i]['xy'].append(xy)
 
     # Record initial reset observations
@@ -134,14 +140,24 @@ def collect_to_memory(world, episodes, seed):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--maze_type', default='large', help='OGBench maze type (large, umaze, medium, ...)')
+    parser.add_argument(
+        '--maze_type',
+        default='large',
+        help='OGBench maze type (large, umaze, medium, ...)',
+    )
     parser.add_argument('--num_episodes', type=int, default=NUM_EPISODES)
     parser.add_argument('--max_steps', type=int, default=MAX_EPISODE_STEPS)
-    parser.add_argument('--dataset_name', default=None, help='Override dataset filename (default: ogb_pointmaze_<maze_type>.lance)')
+    parser.add_argument(
+        '--dataset_name',
+        default=None,
+        help='Override dataset filename (default: ogb_pointmaze_<maze_type>.lance)',
+    )
     args = parser.parse_args()
 
     dataset_name = args.dataset_name or f'ogb_pointmaze_{args.maze_type}.lance'
-    dataset_path = Path(swm.data.utils.get_cache_dir()) / 'datasets' / dataset_name
+    dataset_path = (
+        Path(swm.data.utils.get_cache_dir()) / 'datasets' / dataset_name
+    )
 
     world = swm.World(
         'swm/OGBMaze-v0',
@@ -157,10 +173,16 @@ def main():
     )
     world.set_policy(PointMazeOraclePolicy())
 
-    print(f'Collecting {args.num_episodes} episodes with {NUM_ENVS} envs...', flush=True)
+    print(
+        f'Collecting {args.num_episodes} episodes with {NUM_ENVS} envs...',
+        flush=True,
+    )
     episodes = collect_to_memory(world, args.num_episodes, seed=SEED)
 
-    print(f'Collected {len(episodes)} episodes. Writing to {dataset_path}...', flush=True)
+    print(
+        f'Collected {len(episodes)} episodes. Writing to {dataset_path}...',
+        flush=True,
+    )
     dataset_path.parent.mkdir(parents=True, exist_ok=True)
     with get_format('lance').open_writer(dataset_path) as w:
         w.write_episodes(iter(episodes))

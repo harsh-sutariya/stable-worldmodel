@@ -12,15 +12,22 @@ from omegaconf import OmegaConf
 
 def _git_info() -> dict[str, str]:
     """Return current git branch and short commit hash, or empty strings on failure."""
+
     def _run(cmd):
         try:
-            return subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode().strip()
+            return (
+                subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
+                .decode()
+                .strip()
+            )
         except Exception:
             return ''
+
     return {
         'git_branch': _run(['git', 'rev-parse', '--abbrev-ref', 'HEAD']),
         'git_commit': _run(['git', 'rev-parse', '--short', 'HEAD']),
     }
+
 
 import stable_worldmodel as swm
 from stable_worldmodel.wm.utils import save_pretrained
@@ -75,6 +82,7 @@ def build_logger(cfg, run_dir: Path | None = None):
         return _build_wandb_logger(cfg, run_dir)
 
     import hydra
+
     pl_logger = hydra.utils.instantiate(logger_cfg)
     pl_logger.log_hyperparams(OmegaConf.to_container(cfg, resolve=True))
     pl_logger.log_hyperparams(_git_info())
