@@ -10,6 +10,9 @@ Usage:
         --dataset ogb_pointmaze_umaze.lance \
         --output qm_agir_umaze \
         --epochs 20
+
+Other envs pass their training resolution / frameskip, e.g. PushT:
+    --dataset galilai-group/lewm-pusht --img-size 56 --frameskip 5
 """
 
 import argparse
@@ -29,27 +32,24 @@ import stable_worldmodel as swm
 from stable_worldmodel.data import get_cache_dir
 from stable_worldmodel.wm.utils import load_pretrained
 
-FRAMESKIP   = 2
-IMG_SIZE    = 64
-MAX_DIST    = 20   # model steps; pairs further than this are treated as negatives
-NEG_LABEL   = MAX_DIST + 5
 BATCH_SIZE  = 512
-EMB_DIM     = 192
 HIDDEN_DIM  = 256
 LR          = 3e-4
 
-transform = transforms.Compose([
-    transforms.ToImage(),
-    transforms.ToDtype(torch.float32, scale=True),
-    transforms.Normalize(**spt.data.dataset_stats.ImageNet),
-    transforms.Resize(size=IMG_SIZE),
-])
+
+def make_transform(img_size: int):
+    return transforms.Compose([
+        transforms.ToImage(),
+        transforms.ToDtype(torch.float32, scale=True),
+        transforms.Normalize(**spt.data.dataset_stats.ImageNet),
+        transforms.Resize(size=img_size),
+    ])
 
 
 class QuasimetricHead(nn.Module):
     """MLP that predicts step-distance between two latent embeddings."""
 
-    def __init__(self, emb_dim: int = EMB_DIM, hidden_dim: int = HIDDEN_DIM):
+    def __init__(self, emb_dim: int, hidden_dim: int = HIDDEN_DIM):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(2 * emb_dim, hidden_dim),
@@ -79,12 +79,12 @@ class PairDataset(Dataset):
         return self.z_pairs[idx, 0], self.z_pairs[idx, 1], self.labels[idx]
 
 
-def encode_episode(model, frames_hwc: np.ndarray) -> np.ndarray:
+def encode_episode(model, transform, frames_hwc: np.ndarray, act_dim: int) -> np.ndarray:
     """Encode (T, H, W, C) uint8 → (T, D) numpy embeddings."""
     ts = torch.stack([transform(f) for f in frames_hwc]).unsqueeze(0)  # (1,T,C,H,W)
     T  = len(frames_hwc)
     with torch.no_grad():
-        info = model.encode({'pixels': ts, 'action': torch.zeros(1, T, 4)})
+        info = model.encode({'pixels': ts, 'action': torch.zeros(1, T, act_dim)})
     return info['emb'][0].numpy()  # (T, D)
 
 
@@ -94,6 +94,9 @@ def build_pairs(
     ep_col: np.ndarray,
     step_col: np.ndarray,
     rng: np.random.Generator,
+    transform,
+    frameskip: int,
+    max_dist: int,
     max_eps: int = 800,
     pairs_per_ep: int = 30,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -109,16 +112,17 @@ def build_pairs(
     for ep_id in tqdm(selected, desc='Encoding episodes'):
         rows = np.where(ep_col == ep_id)[0]
         raw_steps = step_col[rows]
-        if len(raw_steps) < FRAMESKIP * 3:
+        if len(raw_steps) < frameskip * 3:
             continue
         s = int(raw_steps[0])
-        n_model_steps = len(raw_steps) // FRAMESKIP
-        span = n_model_steps * FRAMESKIP
+        n_model_steps = len(raw_steps) // frameskip
+        span = n_model_steps * frameskip
         chunk = ds.load_chunk(
             np.array([ep_id]), np.array([s]), np.array([s + span])
         )[0]
-        px = chunk['pixels'][::FRAMESKIP].permute(0, 2, 3, 1).numpy()  # (T, H,W,C)
-        embs = encode_episode(model, px)  # (T, D)
+        px = chunk['pixels'][::frameskip].permute(0, 2, 3, 1).numpy()  # (T, H,W,C)
+        act_dim = chunk['action'].shape[-1] * frameskip
+        embs = encode_episode(model, transform, px, act_dim)  # (T, D)
         ep_embs[ep_id] = embs
 
     # Positive pairs: same episode, distance = k model steps
@@ -126,14 +130,14 @@ def build_pairs(
         T = len(embs)
         for _ in range(pairs_per_ep):
             i = int(rng.integers(0, T - 1))
-            max_k = min(MAX_DIST, T - 1 - i)
+            max_k = min(max_dist, T - 1 - i)
             if max_k < 1:
                 continue
             k = int(rng.integers(1, max_k + 1))
             all_pairs.append([embs[i], embs[i + k]])
             all_labels.append(float(k))
 
-    # Negative pairs: cross-episode, label = NEG_LABEL
+    # Negative pairs: cross-episode, label = max_dist + 5
     ep_list = list(ep_embs.keys())
     n_neg = len(all_pairs) // 2
     for _ in range(n_neg):
@@ -141,7 +145,7 @@ def build_pairs(
         i = int(rng.integers(0, len(ep_embs[ep_a])))
         j = int(rng.integers(0, len(ep_embs[ep_b])))
         all_pairs.append([ep_embs[ep_a][i], ep_embs[ep_b][j]])
-        all_labels.append(float(NEG_LABEL))
+        all_labels.append(float(max_dist + 5))
 
     z_pairs = np.array(all_pairs, dtype=np.float32)  # (N, 2, D)
     labels  = np.array(all_labels, dtype=np.float32)  # (N,)
@@ -163,11 +167,18 @@ def train(args):
     step_col = ds.get_col_data('step_idx')
 
     print('Building training pairs…')
-    z_pairs, labels = build_pairs(model, ds, ep_col, step_col, rng)
-    print(f'  {len(labels)} pairs  (pos: {(labels < NEG_LABEL).sum()}, neg: {(labels >= NEG_LABEL).sum()})')
+    neg_label = args.max_dist + 5
+    z_pairs, labels = build_pairs(
+        model, ds, ep_col, step_col, rng,
+        transform=make_transform(args.img_size),
+        frameskip=args.frameskip,
+        max_dist=args.max_dist,
+    )
+    emb_dim = z_pairs.shape[-1]
+    print(f'  {len(labels)} pairs  (pos: {(labels < neg_label).sum()}, neg: {(labels >= neg_label).sum()})')
 
     # Normalise labels to [0, 1] range for stable training
-    label_scale = float(NEG_LABEL)
+    label_scale = float(neg_label)
     labels_norm = labels / label_scale
 
     # 90/10 split
@@ -181,7 +192,7 @@ def train(args):
     tr_dl = DataLoader(tr_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
     va_dl = DataLoader(va_ds, batch_size=BATCH_SIZE)
 
-    head = QuasimetricHead(EMB_DIM, HIDDEN_DIM).to(device)
+    head = QuasimetricHead(emb_dim, HIDDEN_DIM).to(device)
     opt  = torch.optim.Adam(head.parameters(), lr=LR)
 
     best_val, best_state = float('inf'), None
@@ -215,7 +226,7 @@ def train(args):
     ckpt_dir = Path(get_cache_dir(sub_folder='checkpoints')) / args.output
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = ckpt_dir / 'qm_head.pt'
-    torch.save({'state_dict': best_state, 'emb_dim': EMB_DIM, 'hidden_dim': HIDDEN_DIM,
+    torch.save({'state_dict': best_state, 'emb_dim': emb_dim, 'hidden_dim': HIDDEN_DIM,
                 'label_scale': label_scale}, ckpt_path)
     print(f'Saved to {ckpt_path}  (best_val={best_val:.4f})')
 
@@ -240,4 +251,7 @@ if __name__ == '__main__':
     parser.add_argument('--dataset', required=True, help='Dataset name')
     parser.add_argument('--output',  required=True, help='Output checkpoint name')
     parser.add_argument('--epochs',  type=int, default=20)
+    parser.add_argument('--img-size',  type=int, default=64, help='training image resolution')
+    parser.add_argument('--frameskip', type=int, default=2,  help='training frameskip (raw steps per model step)')
+    parser.add_argument('--max-dist',  type=int, default=20, help='max positive-pair gap in model steps')
     train(parser.parse_args())
