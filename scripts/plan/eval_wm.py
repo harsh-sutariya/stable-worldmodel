@@ -52,12 +52,15 @@ def get_episodes_length(dataset, episodes):
 
 
 def get_dataset(cfg, dataset_name):
-    dataset = swm.data.load_dataset(
+    kwargs = {}
+    if cfg.dataset.get('keys_to_load'):
+        kwargs['keys_to_load'] = list(cfg.dataset.keys_to_load)
+    return swm.data.load_dataset(
         dataset_name,
         cache_dir=cfg.get('cache_dir', None),
         keys_to_cache=list(cfg.dataset.keys_to_cache),
+        **kwargs,
     )
-    return dataset
 
 
 def eval_model(cfg: DictConfig, model=None) -> dict:

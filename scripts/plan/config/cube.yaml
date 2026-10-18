@@ -18,6 +18,15 @@ world:
 
 dataset:
   stats: ${eval.dataset_name}
+  # Explicit: the dataset has a legacy string column (privileged_target_task)
+  # that the Lance reader rejects when loading all columns.
+  keys_to_load:
+    - pixels
+    - action
+    - qpos
+    - qvel
+    - privileged_block_0_pos
+    - privileged_block_0_quat
   keys_to_cache:
     - action
     - qpos

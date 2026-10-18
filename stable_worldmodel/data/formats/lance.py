@@ -355,7 +355,7 @@ class LanceDataset(Dataset):
         db = lancedb.connect(self.uri, **self.connect_kwargs)
         table = db.open_table(self.table_name)
 
-        all_legacy_strings = [
+        legacy_strings = [
             f.name
             for f in table.schema
             if f.name not in self._index_columns
@@ -363,15 +363,13 @@ class LanceDataset(Dataset):
                 pa.types.is_string(f.type) or pa.types.is_large_string(f.type)
             )
         ]
-        # Only raise for columns that are explicitly requested. When keys_to_load is
-        # None (load all), string columns are silently skipped at read time anyway, so
-        # a dataset like ogb_cube_single with a stray privileged_target_task column
-        # is usable even though it has the legacy layout for that one column.
+        # A legacy string column is only a problem if it would be read. With
+        # an explicit ``keys_to_load`` that excludes it, the table is usable;
+        # loading every column (``keys_to_load=None``) still raises.
         if keys_to_load is not None:
-            requested = set(keys_to_load)
-            legacy_strings = [c for c in all_legacy_strings if c in requested]
-        else:
-            legacy_strings = []
+            legacy_strings = [
+                c for c in legacy_strings if c in set(keys_to_load)
+            ]
         if legacy_strings:
             raise ValueError(
                 f"Lance table '{self.table_name}' at '{self.uri}' contains "
@@ -391,17 +389,8 @@ class LanceDataset(Dataset):
             ]
 
         self._schema_names = list(table.schema.names)
-        # String columns can't be converted to tensors; exclude them from the
-        # default key set (they are still in the schema but silently skipped).
-        _string_cols = {
-            f.name
-            for f in table.schema
-            if pa.types.is_string(f.type) or pa.types.is_large_string(f.type)
-        }
         available = [
-            c
-            for c in self._schema_names
-            if c not in self._index_columns and c not in _string_cols
+            c for c in self._schema_names if c not in self._index_columns
         ]
         if not available:
             raise ValueError(
