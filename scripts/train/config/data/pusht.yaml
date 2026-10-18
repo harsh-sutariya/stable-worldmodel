@@ -19,14 +19,6 @@ data:
 trainer:
   max_epochs: 10
 
-# AGIR losses — active for this branch
-loss:
-  curv:
-    weight: 0.01
-  agir:
-    weight: 0.01
-    sigma_act: 1.0
-
 # Run probing + CEM planning automatically after training
 post_training:
   run_probe: true

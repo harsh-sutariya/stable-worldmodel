@@ -9,12 +9,6 @@ data:
 img_size: 64
 wm:
   history_size: 3
-loss:
-  curv:
-    weight: 0.01
-  agir:
-    weight: 0.01
-    sigma_act: 1.0
 trainer:
   max_epochs: 10
 post_training:
